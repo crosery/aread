@@ -6,12 +6,27 @@ import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
 
-// Windows UTF-8 fix: set console code page to 65001 (UTF-8)
+// Windows encoding fix
 if (platform() === "win32") {
+  // Method 1: chcp 65001 (works on most Windows 10+)
   spawnSync("chcp", ["65001"], { shell: true, stdio: "ignore" });
+
+  // Method 2: PowerShell - set .NET console encoding (more reliable)
+  spawnSync("powershell", [
+    "-NoProfile", "-Command",
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::InputEncoding = [System.Text.Encoding]::UTF8"
+  ], { stdio: "ignore" });
+
+  // Method 3: ensure Node writes UTF-8 BOM-less output
+  if (process.stdout._handle && process.stdout._handle.setBlocking) {
+    process.stdout._handle.setBlocking(true);
+  }
+
+  // Ensure ddgr subprocess also outputs UTF-8
+  process.env.PYTHONIOENCODING = "utf-8";
 }
 
-const VERSION = "1.2.2";
+const VERSION = "1.2.3";
 const JINA_READ = "https://r.jina.ai";
 const DDGR_VERSION = "2.2";
 const DDGR_URLS = [
@@ -48,7 +63,8 @@ function info(msg) {
 
 function exec(cmd, args, timeout = 30000) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { maxBuffer: 10 * 1024 * 1024, timeout, encoding: "utf-8" }, (err, stdout, stderr) => {
+    const env = { ...process.env, PYTHONIOENCODING: "utf-8", LANG: "en_US.UTF-8" };
+    execFile(cmd, args, { maxBuffer: 10 * 1024 * 1024, timeout, encoding: "utf-8", env }, (err, stdout, stderr) => {
       if (err) {
         err.stderr = stderr;
         reject(err);
