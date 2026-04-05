@@ -1,0 +1,29 @@
+{
+  "name": "jread-cli",
+  "version": "1.0.0",
+  "description": "Fetch any URL as clean Markdown via Jina Reader",
+  "bin": {
+    "jread": "./src/cli.mjs"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "jina",
+    "reader",
+    "markdown",
+    "scraper",
+    "cli",
+    "web",
+    "fetch"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/crosery/jread"
+  }
+}
