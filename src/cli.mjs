@@ -1,11 +1,19 @@
 #!/usr/bin/env node
 
 import { parseArgs } from "node:util";
-import { writeFile } from "node:fs/promises";
+import { writeFile, mkdir, access, chmod } from "node:fs/promises";
+import { execFile, execFileSync } from "node:child_process";
+import { join } from "node:path";
+import { homedir, platform } from "node:os";
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const JINA_READ = "https://r.jina.ai";
-const DDG_URL = "https://html.duckduckgo.com/html/";
+const DDGR_VERSION = "2.2";
+const DDGR_URLS = [
+  `https://raw.githubusercontent.com/jarun/ddgr/v${DDGR_VERSION}/ddgr`,
+  `https://cdn.jsdelivr.net/gh/jarun/ddgr@v${DDGR_VERSION}/ddgr`,
+  `https://gitee.com/mirrors/ddgr/raw/v${DDGR_VERSION}/ddgr`,
+];
 
 // --- Colors (auto-detect TTY) ---
 
@@ -33,20 +41,40 @@ function info(msg) {
   process.stderr.write(`${msg}\n`);
 }
 
-function htmlDecode(str) {
-  return str
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#x27;/g, "'")
-    .replace(/&#39;/g, "'")
-    .replace(/&#x2F;/g, "/")
-    .replace(/&nbsp;/g, " ");
+function exec(cmd, args, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { maxBuffer: 10 * 1024 * 1024, timeout }, (err, stdout, stderr) => {
+      if (err) {
+        err.stderr = stderr;
+        reject(err);
+      } else resolve(stdout);
+    });
+  });
 }
 
-function stripTags(str) {
-  return str.replace(/<[^>]*>/g, "").trim();
+async function fileExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cmdExists(cmd) {
+  try {
+    execFileSync(platform() === "win32" ? "where" : "which", [cmd], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findPython() {
+  for (const cmd of platform() === "win32" ? ["python", "python3", "py"] : ["python3", "python"]) {
+    if (cmdExists(cmd)) return cmd;
+  }
+  return null;
 }
 
 function printHelp() {
@@ -92,7 +120,11 @@ ${c.bold}JINA HEADERS${c.reset}
 ${c.bold}INSTALL${c.reset}
     npm i -g aread-cli
     bun i -g aread-cli
-    npx aread-cli <URL>`);
+    npx aread-cli <URL>
+
+${c.bold}NOTE${c.reset}
+    Search requires Python 3. First search auto-downloads ddgr to cache.
+    Reading works without Python.`);
 }
 
 // --- Parse args ---
@@ -161,63 +193,86 @@ async function jinaFetch(url) {
   return body;
 }
 
-// --- DuckDuckGo search (built-in, zero deps) ---
+// --- ddgr management ---
 
-async function ddgSearch(query, num) {
-  const timeout = parseInt(opts.timeout, 10) * 1000;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-
-  const res = await fetch(DDG_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": "Mozilla/5.0 (compatible; aread-cli/1.1.0)",
-    },
-    body: `q=${encodeURIComponent(query)}`,
-    signal: controller.signal,
-    redirect: "follow",
-  });
-  clearTimeout(timer);
-
-  if (!res.ok) die(`DuckDuckGo returned HTTP ${res.status}`);
-
-  const html = await res.text();
-  return parseDDGResults(html, num);
+function getCacheDir() {
+  const home = homedir();
+  if (platform() === "win32") {
+    return join(process.env.LOCALAPPDATA || join(home, "AppData", "Local"), "aread");
+  }
+  return join(process.env.XDG_CACHE_HOME || join(home, ".cache"), "aread");
 }
 
-function parseDDGResults(html, max) {
-  const results = [];
-  // Match each result block: <a class="result__a" href="...">title</a> + snippet
-  const resultBlocks = html.split(/class="result__body/g).slice(1);
+async function downloadWithFallback(urls, dest) {
+  for (const url of urls) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      const res = await fetch(url, { signal: controller.signal, redirect: "follow" });
+      clearTimeout(timer);
+      if (res.ok) {
+        const text = await res.text();
+        if (text.startsWith("#!/")) {
+          await writeFile(dest, text, "utf-8");
+          return true;
+        }
+      }
+    } catch {}
+  }
+  return false;
+}
 
-  for (const block of resultBlocks) {
-    if (results.length >= max) break;
+async function ensureDdgr() {
+  // 1. Check system ddgr
+  if (cmdExists("ddgr")) return { cmd: "ddgr", args: [] };
 
-    // Extract URL
-    const urlMatch = block.match(/class="result__a"[^>]*href="([^"]+)"/);
-    if (!urlMatch) continue;
+  // 2. Check cached ddgr
+  const cacheDir = getCacheDir();
+  const ddgrPath = join(cacheDir, "ddgr");
+  const python = findPython();
 
-    let url = urlMatch[1];
-    // DDG wraps URLs in redirect, extract actual URL
-    const uddgMatch = url.match(/uddg=([^&]+)/);
-    if (uddgMatch) url = decodeURIComponent(uddgMatch[1]);
-
-    // Skip DDG internal links
-    if (url.startsWith("/") || url.includes("duckduckgo.com")) continue;
-
-    // Extract title
-    const titleMatch = block.match(/class="result__a"[^>]*>(.+?)<\/a>/s);
-    const title = titleMatch ? htmlDecode(stripTags(titleMatch[1])) : url;
-
-    // Extract snippet
-    const snippetMatch = block.match(/class="result__snippet"[^>]*>(.*?)<\/(?:a|td|div|span)/s);
-    const snippet = snippetMatch ? htmlDecode(stripTags(snippetMatch[1])) : "";
-
-    results.push({ title, url, snippet });
+  if (await fileExists(ddgrPath)) {
+    if (!python) die("Python 3 is required for search. Install from https://python.org");
+    return { cmd: python, args: [ddgrPath] };
   }
 
-  return results;
+  // 3. Download ddgr
+  if (!python) die("Python 3 is required for search. Install from https://python.org");
+
+  info(`${c.dim}first run: downloading ddgr search engine (~60KB)...${c.reset}`);
+  await mkdir(cacheDir, { recursive: true });
+
+  const ok = await downloadWithFallback(DDGR_URLS, ddgrPath);
+  if (!ok) {
+    die(
+      `failed to download ddgr. Install it manually:\n` +
+        `       ${c.dim}arch:${c.reset}   pacman -S ddgr\n` +
+        `       ${c.dim}mac:${c.reset}    brew install ddgr\n` +
+        `       ${c.dim}pip:${c.reset}    pip install ddgr\n` +
+        `       ${c.dim}win:${c.reset}    pip install ddgr`
+    );
+  }
+
+  if (platform() !== "win32") await chmod(ddgrPath, 0o755);
+
+  info(`${c.green}done${c.reset} ${c.dim}(cached at ${ddgrPath})${c.reset}\n`);
+  return { cmd: python, args: [ddgrPath] };
+}
+
+// --- DuckDuckGo search ---
+
+async function ddgSearch(query, num) {
+  const { cmd, args: baseArgs } = await ensureDdgr();
+  const timeout = parseInt(opts.timeout, 10) * 1000;
+  const args = [...baseArgs, "--json", "-n", String(num), query];
+
+  try {
+    const stdout = await exec(cmd, args, timeout);
+    return JSON.parse(stdout);
+  } catch (e) {
+    if (e.killed) die(`search timed out after ${opts.timeout}s`);
+    die(`search failed: ${e.message}${e.stderr ? "\n       " + e.stderr.trim() : ""}`);
+  }
 }
 
 function formatSearchResults(results) {
@@ -226,21 +281,18 @@ function formatSearchResults(results) {
       (r, i) =>
         `${c.bold}${i + 1}.${c.reset} ${c.cyan}${r.title}${c.reset}\n` +
         `   ${c.dim}${r.url}${c.reset}\n` +
-        `   ${r.snippet}`
+        `   ${r.abstract || ""}`
     )
     .join("\n\n");
 }
 
 function formatSearchResultsRaw(results) {
-  return results
-    .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`)
-    .join("\n\n");
+  return results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.abstract || ""}`).join("\n\n");
 }
 
 // --- Main ---
 
 if (opts.search) {
-  // Search mode
   const num = parseInt(opts.num, 10);
   info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset}`);
 
@@ -248,8 +300,7 @@ if (opts.search) {
   try {
     results = await ddgSearch(opts.search, num);
   } catch (e) {
-    if (e.name === "AbortError") die(`search timed out after ${opts.timeout}s`);
-    die(`search failed: ${e.message}`);
+    die(e.message);
   }
 
   if (!results || results.length === 0) {
@@ -259,7 +310,6 @@ if (opts.search) {
   info(`${c.dim}found ${results.length} results${c.reset}\n`);
 
   if (opts.read) {
-    // Search + read each result
     info(`${c.dim}reading ${results.length} pages...${c.reset}\n`);
 
     const parts = [];
@@ -276,13 +326,14 @@ if (opts.search) {
     const output = parts.join("\n\n");
     if (opts.output) {
       await writeFile(opts.output, output, "utf-8");
-      info(`\n${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(output)} bytes)${c.reset}`);
+      info(
+        `\n${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(output)} bytes)${c.reset}`
+      );
     } else {
       process.stdout.write(output);
       if (!output.endsWith("\n")) process.stdout.write("\n");
     }
   } else {
-    // Search only
     const output = raw ? formatSearchResultsRaw(results) : formatSearchResults(results);
     if (opts.output) {
       await writeFile(opts.output, output, "utf-8");
@@ -292,7 +343,6 @@ if (opts.search) {
     }
   }
 } else {
-  // Read mode
   let url = positionals[0];
   if (!url) die("missing URL (try aread --help)");
   if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
@@ -304,7 +354,9 @@ if (opts.search) {
 
     if (opts.output) {
       await writeFile(opts.output, body, "utf-8");
-      info(`${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(body)} bytes)${c.reset}`);
+      info(
+        `${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(body)} bytes)${c.reset}`
+      );
     } else {
       process.stdout.write(body);
       if (!body.endsWith("\n")) process.stdout.write("\n");

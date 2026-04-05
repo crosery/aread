@@ -2,16 +2,15 @@
 
 > Read any URL as Markdown. Search the web from your terminal. Feed it all to AI.
 
-Zero dependencies. Single file. No API keys. Works everywhere Node.js 18+ or Bun runs.
+Zero npm dependencies. Single file. No API keys. Works on Linux, macOS, and Windows.
 
 ## Why
 
 - `curl` gives raw HTML — useless for AI or reading
 - Browser extensions can't be scripted or piped
 - Jina Reader is great but has no CLI
-- DuckDuckGo is private but has no good terminal client
 
-`aread` combines both: **read** any page as clean Markdown, **search** the web via DuckDuckGo — all from one command. Completely free, zero dependencies, no API keys.
+`aread` gives you: **read** any page as clean Markdown, **search** the web via DuckDuckGo — all from one command. Completely free, no API keys.
 
 ## Install
 
@@ -26,6 +25,8 @@ npm i -g aread-cli
 npx aread-cli https://example.com
 ```
 
+> **Note**: Search uses [ddgr](https://github.com/jarun/ddgr) (a Python script). If `ddgr` isn't on your system, aread auto-downloads it to cache on first search. Requires Python 3. Reading works without Python.
+
 ## Quick Start
 
 ```bash
@@ -35,7 +36,7 @@ aread https://example.com
 # Just type the domain
 aread example.com
 
-# Search the web
+# Search the web (default 10 results)
 aread -s "rust async tutorial"
 
 # Search + read all results as Markdown
@@ -118,13 +119,14 @@ done
 ## How It Works
 
 - **Read**: sends URL to [Jina Reader](https://jina.ai/reader/) which renders the page (JS included) and returns clean Markdown. Free, no key needed.
-- **Search**: directly queries DuckDuckGo HTML endpoint and parses results. No external tools, no API keys, no tracking.
+- **Search**: uses [ddgr](https://github.com/jarun/ddgr) for DuckDuckGo results. Auto-downloaded on first use if not installed. Private, no tracking.
 - **Search + Read**: combines both — searches first, then reads each result page via Jina.
 
 ## Requirements
 
 - Node.js >= 18 or Bun
-- That's it. Zero npm dependencies. Zero external tools.
+- Python 3 (for search only, reading works without it)
+- Zero npm dependencies
 
 ## License
 
