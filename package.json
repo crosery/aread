@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "AI-friendly web reader & search. Read any URL as Markdown, search with DuckDuckGo.",
   "bin": {
-    "aread": "./src/cli.mjs"
+    "aread": "src/cli.mjs"
   },
   "type": "module",
   "engines": {
@@ -27,6 +27,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/crosery/jread"
+    "url": "git+https://github.com/crosery/jread.git"
   }
 }
