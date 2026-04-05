@@ -1,6 +1,6 @@
 {
   "name": "aread-cli",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "AI-friendly web reader & search. Read any URL as Markdown, search with DuckDuckGo.",
   "bin": {
     "aread": "src/cli.mjs"

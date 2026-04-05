@@ -2,10 +2,10 @@
 
 import { parseArgs } from "node:util";
 import { writeFile } from "node:fs/promises";
-import { execFile } from "node:child_process";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const JINA_READ = "https://r.jina.ai";
+const DDG_URL = "https://html.duckduckgo.com/html/";
 
 // --- Colors (auto-detect TTY) ---
 
@@ -14,13 +14,12 @@ const c = isTTY
   ? {
       red: "\x1b[0;31m",
       green: "\x1b[0;32m",
-      yellow: "\x1b[0;33m",
       cyan: "\x1b[0;36m",
       dim: "\x1b[2m",
       bold: "\x1b[1m",
       reset: "\x1b[0m",
     }
-  : { red: "", green: "", yellow: "", cyan: "", dim: "", bold: "", reset: "" };
+  : { red: "", green: "", cyan: "", dim: "", bold: "", reset: "" };
 
 // --- Helpers ---
 
@@ -34,13 +33,20 @@ function info(msg) {
   process.stderr.write(`${msg}\n`);
 }
 
-function exec(cmd, args) {
-  return new Promise((resolve, reject) => {
-    execFile(cmd, args, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
-      if (err) reject(err);
-      else resolve(stdout);
-    });
-  });
+function htmlDecode(str) {
+  return str
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x2F;/g, "/")
+    .replace(/&nbsp;/g, " ");
+}
+
+function stripTags(str) {
+  return str.replace(/<[^>]*>/g, "").trim();
 }
 
 function printHelp() {
@@ -48,7 +54,7 @@ function printHelp() {
 
 ${c.bold}USAGE${c.reset}
     aread <URL>                Read a page as Markdown
-    aread -s <QUERY>           Search the web (via DuckDuckGo)
+    aread -s <QUERY>           Search the web (DuckDuckGo)
     aread -s <QUERY> --read    Search + read top results as Markdown
 
 ${c.bold}READ OPTIONS${c.reset}
@@ -58,8 +64,8 @@ ${c.bold}READ OPTIONS${c.reset}
     -H, --header <K:V>         Extra Jina header (repeatable)
 
 ${c.bold}SEARCH OPTIONS${c.reset}
-    -s, --search <QUERY>       Search via DuckDuckGo (ddgr)
-    -n, --num <N>              Number of search results (default: 5)
+    -s, --search <QUERY>       Search via DuckDuckGo
+    -n, --num <N>              Number of search results (default: 10)
     --read                     Also fetch each result as Markdown
 
 ${c.bold}GENERAL${c.reset}
@@ -86,11 +92,7 @@ ${c.bold}JINA HEADERS${c.reset}
 ${c.bold}INSTALL${c.reset}
     npm i -g aread-cli
     bun i -g aread-cli
-    npx aread-cli <URL>
-
-${c.bold}DEPS${c.reset}
-    Search requires ddgr: https://github.com/jarun/ddgr
-      arch: pacman -S ddgr | mac: brew install ddgr | pip: pip install ddgr`);
+    npx aread-cli <URL>`);
 }
 
 // --- Parse args ---
@@ -105,7 +107,7 @@ try {
       timeout: { type: "string", short: "t", default: "30" },
       header: { type: "string", short: "H", multiple: true, default: [] },
       search: { type: "string", short: "s" },
-      num: { type: "string", short: "n", default: "5" },
+      num: { type: "string", short: "n", default: "10" },
       read: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -159,23 +161,63 @@ async function jinaFetch(url) {
   return body;
 }
 
-// --- DuckDuckGo search via ddgr ---
+// --- DuckDuckGo search (built-in, zero deps) ---
 
 async function ddgSearch(query, num) {
-  try {
-    const stdout = await exec("ddgr", ["--json", "-n", String(num), query]);
-    return JSON.parse(stdout);
-  } catch (e) {
-    if (e.code === "ENOENT") {
-      die(
-        `ddgr not found. Install it first:\n` +
-          `       ${c.dim}arch:${c.reset} pacman -S ddgr\n` +
-          `       ${c.dim}mac:${c.reset}  brew install ddgr\n` +
-          `       ${c.dim}pip:${c.reset}  pip install ddgr`
-      );
-    }
-    die(`ddgr failed: ${e.message}`);
+  const timeout = parseInt(opts.timeout, 10) * 1000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  const res = await fetch(DDG_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": "Mozilla/5.0 (compatible; aread-cli/1.1.0)",
+    },
+    body: `q=${encodeURIComponent(query)}`,
+    signal: controller.signal,
+    redirect: "follow",
+  });
+  clearTimeout(timer);
+
+  if (!res.ok) die(`DuckDuckGo returned HTTP ${res.status}`);
+
+  const html = await res.text();
+  return parseDDGResults(html, num);
+}
+
+function parseDDGResults(html, max) {
+  const results = [];
+  // Match each result block: <a class="result__a" href="...">title</a> + snippet
+  const resultBlocks = html.split(/class="result__body/g).slice(1);
+
+  for (const block of resultBlocks) {
+    if (results.length >= max) break;
+
+    // Extract URL
+    const urlMatch = block.match(/class="result__a"[^>]*href="([^"]+)"/);
+    if (!urlMatch) continue;
+
+    let url = urlMatch[1];
+    // DDG wraps URLs in redirect, extract actual URL
+    const uddgMatch = url.match(/uddg=([^&]+)/);
+    if (uddgMatch) url = decodeURIComponent(uddgMatch[1]);
+
+    // Skip DDG internal links
+    if (url.startsWith("/") || url.includes("duckduckgo.com")) continue;
+
+    // Extract title
+    const titleMatch = block.match(/class="result__a"[^>]*>(.+?)<\/a>/s);
+    const title = titleMatch ? htmlDecode(stripTags(titleMatch[1])) : url;
+
+    // Extract snippet
+    const snippetMatch = block.match(/class="result__snippet"[^>]*>(.*?)<\/(?:a|td|div|span)/s);
+    const snippet = snippetMatch ? htmlDecode(stripTags(snippetMatch[1])) : "";
+
+    results.push({ title, url, snippet });
   }
+
+  return results;
 }
 
 function formatSearchResults(results) {
@@ -184,14 +226,14 @@ function formatSearchResults(results) {
       (r, i) =>
         `${c.bold}${i + 1}.${c.reset} ${c.cyan}${r.title}${c.reset}\n` +
         `   ${c.dim}${r.url}${c.reset}\n` +
-        `   ${r.abstract || ""}`
+        `   ${r.snippet}`
     )
     .join("\n\n");
 }
 
 function formatSearchResultsRaw(results) {
   return results
-    .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.abstract || ""}`)
+    .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`)
     .join("\n\n");
 }
 
@@ -200,17 +242,25 @@ function formatSearchResultsRaw(results) {
 if (opts.search) {
   // Search mode
   const num = parseInt(opts.num, 10);
-  info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset} ${c.dim}(${num} results)${c.reset}`);
+  info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset}`);
 
-  const results = await ddgSearch(opts.search, num);
+  let results;
+  try {
+    results = await ddgSearch(opts.search, num);
+  } catch (e) {
+    if (e.name === "AbortError") die(`search timed out after ${opts.timeout}s`);
+    die(`search failed: ${e.message}`);
+  }
 
   if (!results || results.length === 0) {
     die("no results found");
   }
 
+  info(`${c.dim}found ${results.length} results${c.reset}\n`);
+
   if (opts.read) {
     // Search + read each result
-    info(`${c.dim}reading ${results.length} results...${c.reset}\n`);
+    info(`${c.dim}reading ${results.length} pages...${c.reset}\n`);
 
     const parts = [];
     for (const [i, r] of results.entries()) {
@@ -232,7 +282,7 @@ if (opts.search) {
       if (!output.endsWith("\n")) process.stdout.write("\n");
     }
   } else {
-    // Search only — print results
+    // Search only
     const output = raw ? formatSearchResultsRaw(results) : formatSearchResults(results);
     if (opts.output) {
       await writeFile(opts.output, output, "utf-8");

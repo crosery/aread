@@ -2,16 +2,16 @@
 
 > Read any URL as Markdown. Search the web from your terminal. Feed it all to AI.
 
-Zero dependencies. Single file. Works everywhere Node.js 18+ or Bun runs.
+Zero dependencies. Single file. No API keys. Works everywhere Node.js 18+ or Bun runs.
 
 ## Why
 
 - `curl` gives raw HTML — useless for AI or reading
 - Browser extensions can't be scripted or piped
 - Jina Reader is great but has no CLI
-- DuckDuckGo is private but has no good terminal integration
+- DuckDuckGo is private but has no good terminal client
 
-`aread` combines both: **read** any page as clean Markdown, **search** the web via DuckDuckGo — all from one command, all free, no API keys needed.
+`aread` combines both: **read** any page as clean Markdown, **search** the web via DuckDuckGo — all from one command. Completely free, zero dependencies, no API keys.
 
 ## Install
 
@@ -24,19 +24,6 @@ npm i -g aread-cli
 
 # run without installing
 npx aread-cli https://example.com
-```
-
-Search requires [ddgr](https://github.com/jarun/ddgr):
-
-```bash
-# arch
-pacman -S ddgr
-
-# mac
-brew install ddgr
-
-# pip
-pip install ddgr
 ```
 
 ## Quick Start
@@ -81,7 +68,7 @@ aread -s <QUERY> --read    Search + read top results as Markdown
 | Flag | Description |
 |------|-------------|
 | `-s, --search <QUERY>` | Search via DuckDuckGo |
-| `-n, --num <N>` | Number of results (default: 5) |
+| `-n, --num <N>` | Number of results (default: 10) |
 | `--read` | Also fetch each result as Markdown |
 
 ### General
@@ -130,15 +117,14 @@ done
 
 ## How It Works
 
-- **Read**: sends URL to [Jina Reader](https://jina.ai/reader/) which renders the page (JS included) and returns Markdown. Free, no key needed.
-- **Search**: calls [ddgr](https://github.com/jarun/ddgr) for DuckDuckGo results. Private, no tracking.
-- **Search + Read**: combines both — searches first, then reads each result page.
+- **Read**: sends URL to [Jina Reader](https://jina.ai/reader/) which renders the page (JS included) and returns clean Markdown. Free, no key needed.
+- **Search**: directly queries DuckDuckGo HTML endpoint and parses results. No external tools, no API keys, no tracking.
+- **Search + Read**: combines both — searches first, then reads each result page via Jina.
 
 ## Requirements
 
 - Node.js >= 18 or Bun
-- [ddgr](https://github.com/jarun/ddgr) (only for search)
-- Zero npm dependencies
+- That's it. Zero npm dependencies. Zero external tools.
 
 ## License
 
