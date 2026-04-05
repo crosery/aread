@@ -2,10 +2,10 @@
 
 import { parseArgs } from "node:util";
 import { writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 
 const VERSION = "1.0.0";
 const JINA_READ = "https://r.jina.ai";
-const JINA_SEARCH = "https://s.jina.ai";
 
 // --- Colors (auto-detect TTY) ---
 
@@ -14,12 +14,13 @@ const c = isTTY
   ? {
       red: "\x1b[0;31m",
       green: "\x1b[0;32m",
+      yellow: "\x1b[0;33m",
       cyan: "\x1b[0;36m",
       dim: "\x1b[2m",
       bold: "\x1b[1m",
       reset: "\x1b[0m",
     }
-  : { red: "", green: "", cyan: "", dim: "", bold: "", reset: "" };
+  : { red: "", green: "", yellow: "", cyan: "", dim: "", bold: "", reset: "" };
 
 // --- Helpers ---
 
@@ -33,28 +34,47 @@ function info(msg) {
   process.stderr.write(`${msg}\n`);
 }
 
+function exec(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout);
+    });
+  });
+}
+
 function printHelp() {
-  console.log(`${c.bold}jread${c.reset} ${c.dim}v${VERSION}${c.reset} - Fetch any URL as clean Markdown via Jina Reader
+  console.log(`${c.bold}aread${c.reset} ${c.dim}v${VERSION}${c.reset} - AI-friendly web reader & search
 
 ${c.bold}USAGE${c.reset}
-    jread [OPTIONS] <URL>
+    aread <URL>                Read a page as Markdown
+    aread -s <QUERY>           Search the web (via DuckDuckGo)
+    aread -s <QUERY> --read    Search + read top results as Markdown
 
-${c.bold}OPTIONS${c.reset}
-    -o, --output <FILE>   Save output to file
-    -r, --raw             Raw output, no status messages
-    -t, --timeout <SEC>   Request timeout in seconds (default: 30)
-    -H, --header <K:V>    Extra header for Jina (repeatable)
-    -s, --search <QUERY>  Search the web via Jina (s.jina.ai)
-    -h, --help            Show this help
-    -v, --version         Show version
+${c.bold}READ OPTIONS${c.reset}
+    -o, --output <FILE>        Save output to file
+    -r, --raw                  No status messages, pipe-friendly
+    -t, --timeout <SEC>        Request timeout (default: 30)
+    -H, --header <K:V>         Extra Jina header (repeatable)
+
+${c.bold}SEARCH OPTIONS${c.reset}
+    -s, --search <QUERY>       Search via DuckDuckGo (ddgr)
+    -n, --num <N>              Number of search results (default: 5)
+    --read                     Also fetch each result as Markdown
+
+${c.bold}GENERAL${c.reset}
+    -h, --help                 Show this help
+    -v, --version              Show version
 
 ${c.bold}EXAMPLES${c.reset}
-    jread https://example.com
-    jread example.com
-    jread -o page.md https://example.com
-    jread -r https://example.com
-    jread -s "rust async tutorial"
-    jread -H "X-With-Links:true" https://example.com
+    aread https://example.com
+    aread example.com
+    aread -o page.md https://example.com
+    aread -r https://example.com | head -50
+    aread -s "rust async tutorial"
+    aread -s "react hooks" -n 3
+    aread -s "node.js streams" --read
+    aread -H "X-With-Links:true" https://example.com
 
 ${c.bold}JINA HEADERS${c.reset}
     X-Return-Format     html | text | screenshot | pageshot
@@ -64,9 +84,13 @@ ${c.bold}JINA HEADERS${c.reset}
     X-Target-Selector   <css> - extract specific element
 
 ${c.bold}INSTALL${c.reset}
-    npm i -g jread-cli
-    bun i -g jread-cli
-    npx jread-cli <URL>`);
+    npm i -g aread-cli
+    bun i -g aread-cli
+    npx aread-cli <URL>
+
+${c.bold}DEPS${c.reset}
+    Search requires ddgr: https://github.com/jarun/ddgr
+      arch: pacman -S ddgr | mac: brew install ddgr | pip: pip install ddgr`);
 }
 
 // --- Parse args ---
@@ -81,19 +105,21 @@ try {
       timeout: { type: "string", short: "t", default: "30" },
       header: { type: "string", short: "H", multiple: true, default: [] },
       search: { type: "string", short: "s" },
+      num: { type: "string", short: "n", default: "5" },
+      read: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
     },
   });
 } catch (e) {
-  die(`${e.message} (try jread --help)`);
+  die(`${e.message} (try aread --help)`);
 }
 
 const { values: opts, positionals } = parsed;
 const raw = opts.raw;
 
 if (opts.version) {
-  console.log(`jread v${VERSION}`);
+  console.log(`aread v${VERSION}`);
   process.exit(0);
 }
 
@@ -102,35 +128,19 @@ if (opts.help) {
   process.exit(0);
 }
 
-// --- Build request ---
+// --- Jina fetch ---
 
-const headers = { Accept: "text/markdown" };
-if (process.env.JINA_API_KEY) {
-  headers["Authorization"] = `Bearer ${process.env.JINA_API_KEY}`;
-}
-for (const h of opts.header) {
-  const idx = h.indexOf(":");
-  if (idx === -1) die(`invalid header format: ${h} (expected Key:Value)`);
-  headers[h.slice(0, idx).trim()] = h.slice(idx + 1).trim();
-}
+async function jinaFetch(url) {
+  const headers = { Accept: "text/markdown" };
+  for (const h of opts.header) {
+    const idx = h.indexOf(":");
+    if (idx === -1) die(`invalid header format: ${h} (expected Key:Value)`);
+    headers[h.slice(0, idx).trim()] = h.slice(idx + 1).trim();
+  }
 
-const timeout = parseInt(opts.timeout, 10) * 1000;
+  const timeout = parseInt(opts.timeout, 10) * 1000;
+  const target = `${JINA_READ}/${url}`;
 
-let target;
-if (opts.search) {
-  target = `${JINA_SEARCH}/${encodeURIComponent(opts.search)}`;
-  info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset}`);
-} else {
-  let url = positionals[0];
-  if (!url) die("missing URL (try jread --help)");
-  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
-  target = `${JINA_READ}/${url}`;
-  info(`${c.dim}fetching${c.reset} ${c.cyan}${url}${c.reset}`);
-}
-
-// --- Fetch ---
-
-try {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
 
@@ -141,35 +151,116 @@ try {
   });
   clearTimeout(timer);
 
-  if (!res.ok) {
-    if (res.status === 401 && opts.search) {
-      die(
-        `search requires a Jina API key.\n       Set JINA_API_KEY env var, or get one free at https://jina.ai/api-key`
-      );
-    }
-    die(`HTTP ${res.status} ${res.statusText}`);
-  }
+  if (!res.ok) die(`HTTP ${res.status} ${res.statusText} for ${url}`);
 
   const body = await res.text();
+  if (!body.trim()) die(`empty response for ${url} - try: aread -H "X-No-Cache:true" ${url}`);
 
-  if (!body.trim()) {
-    die(`empty response - try: jread -H "X-No-Cache:true" <url>`);
+  return body;
+}
+
+// --- DuckDuckGo search via ddgr ---
+
+async function ddgSearch(query, num) {
+  try {
+    const stdout = await exec("ddgr", ["--json", "-n", String(num), query]);
+    return JSON.parse(stdout);
+  } catch (e) {
+    if (e.code === "ENOENT") {
+      die(
+        `ddgr not found. Install it first:\n` +
+          `       ${c.dim}arch:${c.reset} pacman -S ddgr\n` +
+          `       ${c.dim}mac:${c.reset}  brew install ddgr\n` +
+          `       ${c.dim}pip:${c.reset}  pip install ddgr`
+      );
+    }
+    die(`ddgr failed: ${e.message}`);
+  }
+}
+
+function formatSearchResults(results) {
+  return results
+    .map(
+      (r, i) =>
+        `${c.bold}${i + 1}.${c.reset} ${c.cyan}${r.title}${c.reset}\n` +
+        `   ${c.dim}${r.url}${c.reset}\n` +
+        `   ${r.abstract || ""}`
+    )
+    .join("\n\n");
+}
+
+function formatSearchResultsRaw(results) {
+  return results
+    .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.abstract || ""}`)
+    .join("\n\n");
+}
+
+// --- Main ---
+
+if (opts.search) {
+  // Search mode
+  const num = parseInt(opts.num, 10);
+  info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset} ${c.dim}(${num} results)${c.reset}`);
+
+  const results = await ddgSearch(opts.search, num);
+
+  if (!results || results.length === 0) {
+    die("no results found");
   }
 
-  if (opts.output) {
-    await writeFile(opts.output, body, "utf-8");
-    const bytes = Buffer.byteLength(body, "utf-8");
-    info(
-      `${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${bytes} bytes)${c.reset}`
-    );
+  if (opts.read) {
+    // Search + read each result
+    info(`${c.dim}reading ${results.length} results...${c.reset}\n`);
+
+    const parts = [];
+    for (const [i, r] of results.entries()) {
+      info(`${c.dim}[${i + 1}/${results.length}]${c.reset} ${c.cyan}${r.url}${c.reset}`);
+      try {
+        const md = await jinaFetch(r.url);
+        parts.push(`---\n\n## ${i + 1}. ${r.title}\n\n> Source: ${r.url}\n\n${md}`);
+      } catch {
+        parts.push(`---\n\n## ${i + 1}. ${r.title}\n\n> Source: ${r.url}\n\n*Failed to fetch*`);
+      }
+    }
+
+    const output = parts.join("\n\n");
+    if (opts.output) {
+      await writeFile(opts.output, output, "utf-8");
+      info(`\n${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(output)} bytes)${c.reset}`);
+    } else {
+      process.stdout.write(output);
+      if (!output.endsWith("\n")) process.stdout.write("\n");
+    }
   } else {
-    process.stdout.write(body);
-    // Ensure trailing newline
-    if (!body.endsWith("\n")) process.stdout.write("\n");
+    // Search only — print results
+    const output = raw ? formatSearchResultsRaw(results) : formatSearchResults(results);
+    if (opts.output) {
+      await writeFile(opts.output, output, "utf-8");
+      info(`${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset}`);
+    } else {
+      console.log(output);
+    }
   }
-} catch (e) {
-  if (e.name === "AbortError") {
-    die(`request timed out after ${opts.timeout}s`);
+} else {
+  // Read mode
+  let url = positionals[0];
+  if (!url) die("missing URL (try aread --help)");
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+
+  info(`${c.dim}fetching${c.reset} ${c.cyan}${url}${c.reset}`);
+
+  try {
+    const body = await jinaFetch(url);
+
+    if (opts.output) {
+      await writeFile(opts.output, body, "utf-8");
+      info(`${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(body)} bytes)${c.reset}`);
+    } else {
+      process.stdout.write(body);
+      if (!body.endsWith("\n")) process.stdout.write("\n");
+    }
+  } catch (e) {
+    if (e.name === "AbortError") die(`request timed out after ${opts.timeout}s`);
+    die(e.message);
   }
-  die(e.message);
 }

@@ -1,127 +1,144 @@
-# jread
+# aread
 
-> Turn any URL into clean Markdown. Powered by [Jina Reader](https://jina.ai/reader/).
+> Read any URL as Markdown. Search the web from your terminal. Feed it all to AI.
 
 Zero dependencies. Single file. Works everywhere Node.js 18+ or Bun runs.
 
 ## Why
 
-- `curl` gives you raw HTML — useless for reading or piping into LLMs
-- `wget` is the same story
-- Browser extensions can't be scripted
+- `curl` gives raw HTML — useless for AI or reading
+- Browser extensions can't be scripted or piped
+- Jina Reader is great but has no CLI
+- DuckDuckGo is private but has no good terminal integration
 
-`jread` gives you clean, structured Markdown from any URL, in one command.
+`aread` combines both: **read** any page as clean Markdown, **search** the web via DuckDuckGo — all from one command, all free, no API keys needed.
 
 ## Install
 
 ```bash
-# bun (recommended)
-bun i -g jread-cli
+# bun
+bun i -g aread-cli
 
 # npm
-npm i -g jread-cli
+npm i -g aread-cli
 
 # run without installing
-npx jread-cli https://example.com
+npx aread-cli https://example.com
+```
+
+Search requires [ddgr](https://github.com/jarun/ddgr):
+
+```bash
+# arch
+pacman -S ddgr
+
+# mac
+brew install ddgr
+
+# pip
+pip install ddgr
 ```
 
 ## Quick Start
 
 ```bash
-# Read any page
-jread https://example.com
+# Read a page as Markdown
+aread https://example.com
 
-# Auto-adds https:// — just type the domain
-jread example.com
+# Just type the domain
+aread example.com
 
-# Save to file
-jread -o page.md https://example.com
+# Search the web
+aread -s "rust async tutorial"
 
-# Pipe into other tools (no status messages)
-jread -r https://example.com | head -50
+# Search + read all results as Markdown
+aread -s "react hooks guide" --read
 
-# Feed to LLMs
-jread -r https://docs.python.org/3/tutorial | llm "summarize this"
+# Pipe to AI
+aread -r https://docs.python.org/3/tutorial | claude "summarize this"
+aread -r -s "kubernetes networking" --read | claude "explain like I'm 5"
 ```
 
 ## Usage
 
 ```
-jread [OPTIONS] <URL>
+aread <URL>                Read a page as Markdown
+aread -s <QUERY>           Search the web via DuckDuckGo
+aread -s <QUERY> --read    Search + read top results as Markdown
 ```
 
-### Options
+### Read Options
 
 | Flag | Description |
 |------|-------------|
-| `-o, --output <FILE>` | Save output to file |
-| `-r, --raw` | Raw mode — no status messages, ideal for piping |
-| `-t, --timeout <SEC>` | Request timeout (default: 30) |
+| `-o, --output <FILE>` | Save to file |
+| `-r, --raw` | No status messages, pipe-friendly |
+| `-t, --timeout <SEC>` | Timeout in seconds (default: 30) |
 | `-H, --header <K:V>` | Extra Jina header (repeatable) |
-| `-s, --search <QUERY>` | Search the web via Jina (requires API key) |
+
+### Search Options
+
+| Flag | Description |
+|------|-------------|
+| `-s, --search <QUERY>` | Search via DuckDuckGo |
+| `-n, --num <N>` | Number of results (default: 5) |
+| `--read` | Also fetch each result as Markdown |
+
+### General
+
+| Flag | Description |
+|------|-------------|
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
 
-### Examples
+## Examples
 
 ```bash
-# Extract only the article content
-jread -H "X-Target-Selector:article" https://blog.example.com/post
+# Save a page to file
+aread -o page.md https://example.com
+
+# Top 3 search results
+aread -s "node.js streams" -n 3
+
+# Search + save all results as one Markdown file
+aread -s "CSS grid tutorial" --read -o research.md
+
+# Extract only article content
+aread -H "X-Target-Selector:article" https://blog.example.com/post
 
 # Include links in output
-jread -H "X-With-Links:true" https://example.com
+aread -H "X-With-Links:true" https://example.com
 
-# Bypass Jina cache for fresh content
-jread -H "X-No-Cache:true" https://example.com
+# Bypass cache
+aread -H "X-No-Cache:true" https://example.com
 
-# Search the web (requires JINA_API_KEY)
-export JINA_API_KEY="your-key"
-jread -s "rust async tutorial"
-```
-
-### Jina Headers Reference
-
-| Header | Values | Description |
-|--------|--------|-------------|
-| `X-Return-Format` | `html` `text` `screenshot` `pageshot` | Output format |
-| `X-With-Links` | `true` | Include hyperlinks |
-| `X-With-Images` | `true` | Include images |
-| `X-With-Generated-Alt` | `true` | AI-generated alt text |
-| `X-No-Cache` | `true` | Bypass Jina cache |
-| `X-Target-Selector` | CSS selector | Extract specific elements |
-
-## Use Cases
-
-**Feed web pages to AI/LLMs**
-```bash
-jread -r https://docs.example.com | claude "explain this API"
-```
-
-**Save documentation offline**
-```bash
-jread -o react-hooks.md https://react.dev/reference/react/hooks
-```
-
-**Build a research pipeline**
-```bash
+# Build a research pipeline
 for url in $(cat urls.txt); do
-  jread -r "$url" >> research.md
+  aread -r "$url" >> research.md
 done
 ```
 
-**Quick reference from terminal**
-```bash
-jread -r -H "X-Target-Selector:table" https://caniuse.com/css-grid
-```
+## Jina Headers
+
+| Header | Description |
+|--------|-------------|
+| `X-Return-Format` | `html`, `text`, `screenshot`, `pageshot` |
+| `X-With-Links` | `true` - include links |
+| `X-With-Images` | `true` - include images |
+| `X-No-Cache` | `true` - bypass cache |
+| `X-Target-Selector` | CSS selector to extract |
 
 ## How It Works
 
-jread is a thin CLI wrapper around [Jina Reader](https://jina.ai/reader/) (`r.jina.ai`). It sends your URL to Jina's API, which renders the page (including JavaScript), extracts the main content, and returns clean Markdown. No API key needed for reading.
+- **Read**: sends URL to [Jina Reader](https://jina.ai/reader/) which renders the page (JS included) and returns Markdown. Free, no key needed.
+- **Search**: calls [ddgr](https://github.com/jarun/ddgr) for DuckDuckGo results. Private, no tracking.
+- **Search + Read**: combines both — searches first, then reads each result page.
 
 ## Requirements
 
-- Node.js >= 18 or Bun (any version)
-- That's it. Zero npm dependencies.
+- Node.js >= 18 or Bun
+- [ddgr](https://github.com/jarun/ddgr) (only for search)
+- Zero npm dependencies
 
 ## License
 

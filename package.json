@@ -1,9 +1,9 @@
 {
-  "name": "jread-cli",
+  "name": "aread-cli",
   "version": "1.0.0",
-  "description": "Fetch any URL as clean Markdown via Jina Reader",
+  "description": "AI-friendly web reader & search. Read any URL as Markdown, search with DuckDuckGo.",
   "bin": {
-    "jread": "./src/cli.mjs"
+    "aread": "./src/cli.mjs"
   },
   "type": "module",
   "engines": {
@@ -13,13 +13,16 @@
     "src"
   ],
   "keywords": [
-    "jina",
+    "ai",
     "reader",
     "markdown",
+    "search",
+    "duckduckgo",
+    "jina",
     "scraper",
     "cli",
-    "web",
-    "fetch"
+    "llm",
+    "web"
   ],
   "license": "MIT",
   "repository": {
