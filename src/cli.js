@@ -2,11 +2,16 @@
 
 import { parseArgs } from "node:util";
 import { writeFile, mkdir, access, chmod } from "node:fs/promises";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
 
-const VERSION = "1.2.0";
+// Windows UTF-8 fix: set console code page to 65001 (UTF-8)
+if (platform() === "win32") {
+  spawnSync("chcp", ["65001"], { shell: true, stdio: "ignore" });
+}
+
+const VERSION = "1.2.2";
 const JINA_READ = "https://r.jina.ai";
 const DDGR_VERSION = "2.2";
 const DDGR_URLS = [
@@ -43,7 +48,7 @@ function info(msg) {
 
 function exec(cmd, args, timeout = 30000) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { maxBuffer: 10 * 1024 * 1024, timeout }, (err, stdout, stderr) => {
+    execFile(cmd, args, { maxBuffer: 10 * 1024 * 1024, timeout, encoding: "utf-8" }, (err, stdout, stderr) => {
       if (err) {
         err.stderr = stderr;
         reject(err);
