@@ -313,14 +313,13 @@ async function ddgSearch(query, num) {
   const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
-    const params = new URLSearchParams({ q: query, kl: "", df: "" });
-    const res = await fetch("https://html.duckduckgo.com/html/", {
-      method: "POST",
+    const params = new URLSearchParams({ q: query });
+    const res = await fetch(`https://html.duckduckgo.com/html/?${params}`, {
+      method: "GET",
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "Mozilla/5.0 (compatible; aread/1.0)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
       },
-      body: params.toString(),
       signal: controller.signal,
       redirect: "follow",
     });
