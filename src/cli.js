@@ -19,7 +19,7 @@ if (platform() === "win32") {
   }
 }
 
-const VERSION = "1.3.0";
+const VERSION = "1.3.1";
 const JINA_READ = "https://r.jina.ai";
 const SUPPORTED_ENGINES = ["duckduckgo", "bing", "google", "baidu", "auto"];
 const DDG_PROBE_TIMEOUT = 3000;
@@ -526,7 +526,7 @@ async function probeDdg() {
       redirect: "follow",
     });
     clearTimeout(timer);
-    return res.ok;
+    return res.status < 500; // reachable if not server error
   } catch {
     clearTimeout(timer);
     return false;
