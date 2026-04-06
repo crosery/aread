@@ -345,11 +345,12 @@ function parseBingHtml(html, num) {
 
   for (let i = 0; i < Math.min(blocks.length, num); i++) {
     const block = blocks[i][1];
-    const linkMatch = block.match(/<h2[^>]*><a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a><\/h2>/i);
+    // Match <h2><a href="...">Title</a></h2> — h2 may or may not have class attr
+    const linkMatch = block.match(/<h2[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
     if (!linkMatch) continue;
 
     let url = linkMatch[1].replace(/&amp;/g, "&");
-    // Decode Bing redirect URL (u param is base64 with 'a1' prefix)
+    // Decode Bing redirect URL (bing.com/ck/a?...u=base64...)
     try {
       const u = new URL(url);
       const encoded = u.searchParams.get("u");
@@ -377,11 +378,12 @@ async function bingSearch(query, num) {
   const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
-    const params = new URLSearchParams({ q: query, count: String(num) });
+    // Use mkt=en-US to avoid cn.bing.com redirect returning only Zhihu results
+    const params = new URLSearchParams({ q: query, count: String(num), mkt: "en-US" });
     const res = await fetch(`https://www.bing.com/search?${params}`, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
       },
       signal: controller.signal,
       redirect: "follow",
@@ -402,33 +404,51 @@ async function bingSearch(query, num) {
 
 function parseGoogleHtml(html, num) {
   const results = [];
-  // Google wraps each result in <div class="g">
-  const blockRegex = /<div\s+class="[^"]*\bg\b[^"]*">([\s\S]*?)<\/div>\s*(?=<div\s+class="[^"]*\bg\b|$)/gi;
+
+  // Strategy 1: Match <div class="g"> blocks (standard Google layout)
+  const blockRegex = /<div\s+class="[^"]*\bg\b[^"]*"[^>]*>([\s\S]*?)(?=<div\s+class="[^"]*\bg\b[^"]*"|<div\s+id="botstuff")/gi;
   const blocks = [...html.matchAll(blockRegex)];
 
-  for (let i = 0; i < Math.min(blocks.length, num); i++) {
-    const block = blocks[i][1];
-    // Extract first <a href="http..."> link
-    const linkMatch = block.match(/<a[^>]+href="(https?:\/\/[^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
-    if (!linkMatch) continue;
+  for (const block of blocks) {
+    if (results.length >= num) break;
+    const content = block[1];
 
-    const url = linkMatch[1];
-    // Title is usually in <h3>
-    const titleMatch = block.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
-    const title = titleMatch
-      ? titleMatch[1].replace(/<[^>]*>/g, "").trim()
-      : linkMatch[2].replace(/<[^>]*>/g, "").trim();
+    // Title is in <h3> inside an <a> with href
+    const titleLinkMatch = content.match(/<a[^>]+href="(https?:\/\/(?!www\.google\.com)[^"]*)"[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/i)
+      || content.match(/<h3[^>]*>([\s\S]*?)<\/h3>[\s\S]*?<a[^>]+href="(https?:\/\/(?!www\.google\.com)[^"]*)"[^>]*>/i);
+    if (!titleLinkMatch) continue;
 
-    // Snippet in <span> or <div> after the link area
-    let abstract = "";
-    const snippetMatch = block.match(/<span[^>]*class="[^"]*"[^>]*>([\s\S]{20,}?)<\/span>/i)
-      || block.match(/<div[^>]*data-sncf[^>]*>([\s\S]*?)<\/div>/i);
-    if (snippetMatch) {
-      abstract = snippetMatch[1].replace(/<[^>]*>/g, "").trim();
+    // Handle both match orderings (url first or title first)
+    let url, title;
+    if (titleLinkMatch[1].startsWith("http")) {
+      url = titleLinkMatch[1];
+      title = titleLinkMatch[2].replace(/<[^>]*>/g, "").trim();
+    } else {
+      title = titleLinkMatch[1].replace(/<[^>]*>/g, "").trim();
+      url = titleLinkMatch[2];
     }
 
-    if (url && title && !url.includes("google.com/search")) {
-      results.push({ title, url, abstract });
+    // Extract snippet from data-sncf, VwiC3b class, or long <span>
+    let abstract = "";
+    const snippetMatch = content.match(/<div[^>]*(?:data-sncf|class="[^"]*VwiC3b[^"]*")[^>]*>([\s\S]*?)<\/div>/i)
+      || content.match(/<span[^>]*class="[^"]*(?:st|VwiC3b|hgKElc)[^"]*"[^>]*>([\s\S]*?)<\/span>/i)
+      || content.match(/<div[^>]*class="[^"]*IsZvec[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+    if (snippetMatch) {
+      abstract = (snippetMatch[1] || "").replace(/<[^>]*>/g, "").trim();
+    }
+
+    if (url && title) results.push({ title, url, abstract });
+  }
+
+  // Strategy 2: Fallback — scan for <a href> + <h3> pairs anywhere in the HTML
+  if (results.length === 0) {
+    const linkRegex = /<a[^>]+href="(https?:\/\/(?!www\.google\.com|maps\.google|accounts\.google|support\.google|policies\.google)[^"]*)"[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/gi;
+    const links = [...html.matchAll(linkRegex)];
+    for (const m of links) {
+      if (results.length >= num) break;
+      const url = m[1];
+      const title = m[2].replace(/<[^>]*>/g, "").trim();
+      if (url && title) results.push({ title, url, abstract: "" });
     }
   }
 
@@ -466,19 +486,34 @@ async function googleSearch(query, num) {
 
 function parseBaiduHtml(html, num) {
   const results = [];
-  // Baidu results: <div class="result c-container ..."> with <h3 class="t"><a href="...">Title</a></h3>
-  const blockRegex = /<div[^>]+class="[^"]*result[^"]*c-container[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<!--/gi;
-  // Fallback: simpler pattern
-  const blockRegex2 = /<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+  // Baidu wraps results in h3 with class containing "t", linking to baidu redirect URLs
+  const blockRegex = /<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const blocks = [...html.matchAll(blockRegex)];
 
-  const blocks = [...html.matchAll(blockRegex2)];
-  for (let i = 0; i < Math.min(blocks.length, num); i++) {
-    const url = blocks[i][1];
-    const title = blocks[i][2].replace(/<[^>]*>/g, "").replace(/&[^;]+;/g, "").trim();
+  for (const block of blocks) {
+    if (results.length >= num) break;
+    const url = block[1];
+    const title = block[2]
+      .replace(/<[^>]*>/g, "")
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .replace(/&[^;]+;/g, "")
+      .trim();
 
-    // Baidu uses redirect URLs, the real URL is resolved on click
-    // We keep the baidu redirect URL as-is since resolving requires following redirects
-    if (url && title) {
+    // Skip javascript: URLs and empty URLs
+    if (!url || !title || url.startsWith("javascript:")) continue;
+
+    results.push({ title, url, abstract: "" });
+  }
+
+  // Fallback: try c-title links (newer Baidu layout)
+  if (results.length === 0) {
+    const altRegex = /<a[^>]+class="[^"]*c-title[^"]*"[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const altBlocks = [...html.matchAll(altRegex)];
+    for (const block of altBlocks) {
+      if (results.length >= num) break;
+      const url = block[1];
+      const title = block[2].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").trim();
+      if (!url || !title || url.startsWith("javascript:")) continue;
       results.push({ title, url, abstract: "" });
     }
   }
@@ -486,18 +521,64 @@ function parseBaiduHtml(html, num) {
   return results;
 }
 
+// Resolve Baidu redirect URLs (baidu.com/link?url=...) to real target URLs
+async function resolveBaiduUrls(results) {
+  const resolved = await Promise.all(
+    results.map(async (r) => {
+      if (!r.url.includes("baidu.com/link?")) return r;
+      try {
+        const res = await fetch(r.url, {
+          method: "HEAD",
+          redirect: "follow",
+          headers: { "User-Agent": "Mozilla/5.0 (compatible; aread/1.0)" },
+          signal: AbortSignal.timeout(5000),
+        });
+        const realUrl = res.url;
+        if (realUrl && !realUrl.includes("baidu.com/link?")) {
+          return { ...r, url: realUrl };
+        }
+      } catch {
+        // Keep original URL on failure
+      }
+      return r;
+    })
+  );
+  return resolved;
+}
+
 async function baiduSearch(query, num) {
   const timeout = parseInt(opts.timeout, 10) * 1000;
+  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+  // Baidu requires cookies to avoid security verification page.
+  // First visit baidu.com homepage to obtain session cookies.
+  let cookieStr = "";
+  try {
+    const homeRes = await fetch("https://www.baidu.com/", {
+      headers: { "User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
+      redirect: "follow",
+    });
+    const setCookies = homeRes.headers.getSetCookie?.() || [];
+    cookieStr = setCookies.map((c) => c.split(";")[0]).join("; ");
+  } catch {
+    // Continue without cookies — may still work in some regions
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
     const params = new URLSearchParams({ wd: query, rn: String(num) });
+    const headers = {
+      "User-Agent": UA,
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Referer": "https://www.baidu.com/",
+    };
+    if (cookieStr) headers["Cookie"] = cookieStr;
+
     const res = await fetch(`https://www.baidu.com/s?${params}`, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      },
+      headers,
       signal: controller.signal,
       redirect: "follow",
     });
@@ -505,7 +586,14 @@ async function baiduSearch(query, num) {
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = await res.text();
-    return parseBaiduHtml(html, num);
+
+    // Detect security verification page
+    if (html.includes("百度安全验证") && html.length < 5000) {
+      throw new Error("baidu returned security verification page (try again later)");
+    }
+
+    const results = parseBaiduHtml(html, num);
+    return resolveBaiduUrls(results);
   } catch (e) {
     clearTimeout(timer);
     if (e.name === "AbortError") throw new Error(`baidu search timed out after ${opts.timeout}s`);
@@ -544,6 +632,34 @@ async function resolveEngine(engine) {
   }
   info(`${c.dim}DuckDuckGo unreachable, falling back to bing${c.reset}`);
   return "bing";
+}
+
+// Search with automatic fallback: if the chosen engine fails, try alternatives
+async function searchWithFallback(engine, query, num) {
+  const fallbackOrder = {
+    duckduckgo: ["bing", "baidu"],
+    bing: ["baidu"],
+    google: ["bing", "baidu"],
+    baidu: ["bing"],
+  };
+
+  try {
+    const results = await searchWith(engine, query, num);
+    if (results && results.length > 0) return results;
+    throw new Error("no results returned");
+  } catch (primaryErr) {
+    const fallbacks = fallbackOrder[engine] || [];
+    for (const fb of fallbacks) {
+      info(`${c.dim}${engine} failed (${primaryErr.message}), trying ${fb}...${c.reset}`);
+      try {
+        const results = await searchWith(fb, query, num);
+        if (results && results.length > 0) return results;
+      } catch {
+        // continue to next fallback
+      }
+    }
+    throw primaryErr;
+  }
 }
 
 async function searchWith(engine, query, num) {
@@ -585,7 +701,7 @@ if (opts.search) {
 
   let results;
   try {
-    results = await searchWith(engine, opts.search, num);
+    results = await searchWithFallback(engine, opts.search, num);
   } catch (e) {
     die(e.message);
   }
