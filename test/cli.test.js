@@ -140,6 +140,46 @@ describe("native DuckDuckGo search (no Python)", () => {
     assert.ok(stdout.includes("multiple engines") || stdout.includes("DuckDuckGo"));
   });
 
+  it("ddgSearch uses GET method with real browser User-Agent", async () => {
+    // Read the source and verify the DDG search function uses GET + real UA
+    const src = await readFile(CLI, "utf-8");
+
+    // Extract the ddgSearch function body
+    const ddgFnMatch = src.match(/async function ddgSearch[\s\S]*?^}/m);
+    assert.ok(ddgFnMatch, "ddgSearch function should exist");
+    const ddgFn = ddgFnMatch[0];
+
+    // Must use GET, not POST
+    assert.ok(
+      ddgFn.includes('method: "GET"') || !ddgFn.includes('method: "POST"'),
+      "ddgSearch should use GET, not POST"
+    );
+    assert.ok(
+      !ddgFn.includes('"Content-Type": "application/x-www-form-urlencoded"'),
+      "ddgSearch should not send form-encoded body"
+    );
+    assert.ok(
+      !ddgFn.includes("body:"),
+      "ddgSearch GET request should not have a body"
+    );
+
+    // Must use real browser User-Agent, not the generic aread one
+    assert.ok(
+      ddgFn.includes("Chrome/") && ddgFn.includes("AppleWebKit/"),
+      "ddgSearch should use a real browser User-Agent"
+    );
+    assert.ok(
+      !ddgFn.includes('"User-Agent": "Mozilla/5.0 (compatible; aread/1.0)"'),
+      "ddgSearch should not use the generic aread User-Agent"
+    );
+
+    // URL should be query-string based (GET style)
+    assert.ok(
+      ddgFn.includes("html.duckduckgo.com/html/?"),
+      "ddgSearch should append query params to URL (GET style)"
+    );
+  });
+
   it("parseDdgHtml extracts results from mock HTML", async () => {
     // We test the parsing logic by importing it indirectly
     // Since parseDdgHtml is not exported, we test via integration
