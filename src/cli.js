@@ -141,7 +141,7 @@ try {
       header: { type: "string", short: "H", multiple: true, default: [] },
       search: { type: "string", short: "s" },
       num: { type: "string", short: "n", default: "10" },
-      engine: { type: "string", short: "e", default: "duckduckgo" },
+      engine: { type: "string", short: "e", default: "auto" },
       read: { type: "boolean", default: false },
       "no-cache": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
@@ -340,15 +340,21 @@ async function ddgSearch(query, num) {
 function parseBingHtml(html, num) {
   const results = [];
   // Bing results: <li class="b_algo"><h2><a href="URL">Title</a></h2><p class="b_lineclamp...">Snippet</p></li>
-  const blockRegex = /<li\s+class="b_algo">([\s\S]*?)<\/li>/gi;
+  const blockRegex = /<li\s+class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
   const blocks = [...html.matchAll(blockRegex)];
 
   for (let i = 0; i < Math.min(blocks.length, num); i++) {
     const block = blocks[i][1];
-    const linkMatch = block.match(/<h2><a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a><\/h2>/i);
+    const linkMatch = block.match(/<h2[^>]*><a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a><\/h2>/i);
     if (!linkMatch) continue;
 
-    const url = linkMatch[1];
+    let url = linkMatch[1].replace(/&amp;/g, "&");
+    // Decode Bing redirect URL (u param is base64 with 'a1' prefix)
+    try {
+      const u = new URL(url);
+      const encoded = u.searchParams.get("u");
+      if (encoded) url = Buffer.from(encoded.startsWith("a1") ? encoded.slice(2) : encoded, "base64").toString();
+    } catch {}
     const title = linkMatch[2].replace(/<[^>]*>/g, "").trim();
 
     // Extract snippet from various Bing snippet containers
@@ -372,7 +378,7 @@ async function bingSearch(query, num) {
 
   try {
     const params = new URLSearchParams({ q: query, count: String(num) });
-    const res = await fetch(`https://cn.bing.com/search?${params}`, {
+    const res = await fetch(`https://www.bing.com/search?${params}`, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
