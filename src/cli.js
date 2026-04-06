@@ -19,8 +19,10 @@ if (platform() === "win32") {
   }
 }
 
-const VERSION = "1.2.3";
+const VERSION = "1.3.0";
 const JINA_READ = "https://r.jina.ai";
+const SUPPORTED_ENGINES = ["duckduckgo", "bing", "google", "baidu", "auto"];
+const DDG_PROBE_TIMEOUT = 3000;
 
 // --- Colors (auto-detect TTY) ---
 
@@ -75,7 +77,7 @@ function printHelp() {
 
 ${c.bold}USAGE${c.reset}
     aread <URL>                Read a page as Markdown
-    aread -s <QUERY>           Search the web (DuckDuckGo)
+    aread -s <QUERY>           Search the web (default: DuckDuckGo)
     aread -s <QUERY> --read    Search + read top results as Markdown
 
 ${c.bold}READ OPTIONS${c.reset}
@@ -85,8 +87,10 @@ ${c.bold}READ OPTIONS${c.reset}
     -H, --header <K:V>         Extra Jina header (repeatable)
 
 ${c.bold}SEARCH OPTIONS${c.reset}
-    -s, --search <QUERY>       Search via DuckDuckGo
+    -s, --search <QUERY>       Search the web
     -n, --num <N>              Number of search results (default: 10)
+    -e, --engine <ENGINE>      Search engine: duckduckgo|bing|google|baidu|auto
+                               (default: duckduckgo, auto probes DDG then falls back to Bing)
     --read                     Also fetch each result as Markdown
     -c, --concurrency <N>      Concurrent reads (default: 5, with --read)
 
@@ -119,7 +123,8 @@ ${c.bold}INSTALL${c.reset}
     npx aread-cli <URL>
 
 ${c.bold}NOTE${c.reset}
-    Search uses DuckDuckGo natively (no Python required).
+    Search supports multiple engines (DuckDuckGo, Bing, Google, Baidu).
+    Use --engine auto to probe DDG and fallback to Bing if unavailable.
     Jina API is used for reading; falls back to local fetch + turndown.`);
 }
 
@@ -136,6 +141,7 @@ try {
       header: { type: "string", short: "H", multiple: true, default: [] },
       search: { type: "string", short: "s" },
       num: { type: "string", short: "n", default: "10" },
+      engine: { type: "string", short: "e", default: "duckduckgo" },
       read: { type: "boolean", default: false },
       "no-cache": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
@@ -330,6 +336,221 @@ async function ddgSearch(query, num) {
   }
 }
 
+// --- Bing search ---
+
+function parseBingHtml(html, num) {
+  const results = [];
+  // Bing results: <li class="b_algo"><h2><a href="URL">Title</a></h2><p class="b_lineclamp...">Snippet</p></li>
+  const blockRegex = /<li\s+class="b_algo">([\s\S]*?)<\/li>/gi;
+  const blocks = [...html.matchAll(blockRegex)];
+
+  for (let i = 0; i < Math.min(blocks.length, num); i++) {
+    const block = blocks[i][1];
+    const linkMatch = block.match(/<h2><a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a><\/h2>/i);
+    if (!linkMatch) continue;
+
+    const url = linkMatch[1];
+    const title = linkMatch[2].replace(/<[^>]*>/g, "").trim();
+
+    // Extract snippet from various Bing snippet containers
+    let abstract = "";
+    const snippetMatch = block.match(/<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>([\s\S]*?)<\/p>/i)
+      || block.match(/<div[^>]*class="[^"]*b_caption[^"]*"[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/i);
+    if (snippetMatch) {
+      abstract = (snippetMatch[1] || snippetMatch[2] || "").replace(/<[^>]*>/g, "").trim();
+    }
+
+    if (url && title) results.push({ title, url, abstract });
+  }
+
+  return results;
+}
+
+async function bingSearch(query, num) {
+  const timeout = parseInt(opts.timeout, 10) * 1000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const params = new URLSearchParams({ q: query, count: String(num) });
+    const res = await fetch(`https://cn.bing.com/search?${params}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+      },
+      signal: controller.signal,
+      redirect: "follow",
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    return parseBingHtml(html, num);
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === "AbortError") throw new Error(`bing search timed out after ${opts.timeout}s`);
+    throw new Error(`bing search failed: ${e.message}`);
+  }
+}
+
+// --- Google search ---
+
+function parseGoogleHtml(html, num) {
+  const results = [];
+  // Google wraps each result in <div class="g">
+  const blockRegex = /<div\s+class="[^"]*\bg\b[^"]*">([\s\S]*?)<\/div>\s*(?=<div\s+class="[^"]*\bg\b|$)/gi;
+  const blocks = [...html.matchAll(blockRegex)];
+
+  for (let i = 0; i < Math.min(blocks.length, num); i++) {
+    const block = blocks[i][1];
+    // Extract first <a href="http..."> link
+    const linkMatch = block.match(/<a[^>]+href="(https?:\/\/[^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
+    if (!linkMatch) continue;
+
+    const url = linkMatch[1];
+    // Title is usually in <h3>
+    const titleMatch = block.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
+    const title = titleMatch
+      ? titleMatch[1].replace(/<[^>]*>/g, "").trim()
+      : linkMatch[2].replace(/<[^>]*>/g, "").trim();
+
+    // Snippet in <span> or <div> after the link area
+    let abstract = "";
+    const snippetMatch = block.match(/<span[^>]*class="[^"]*"[^>]*>([\s\S]{20,}?)<\/span>/i)
+      || block.match(/<div[^>]*data-sncf[^>]*>([\s\S]*?)<\/div>/i);
+    if (snippetMatch) {
+      abstract = snippetMatch[1].replace(/<[^>]*>/g, "").trim();
+    }
+
+    if (url && title && !url.includes("google.com/search")) {
+      results.push({ title, url, abstract });
+    }
+  }
+
+  return results;
+}
+
+async function googleSearch(query, num) {
+  const timeout = parseInt(opts.timeout, 10) * 1000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const params = new URLSearchParams({ q: query, num: String(num), hl: "en" });
+    const res = await fetch(`https://www.google.com/search?${params}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      signal: controller.signal,
+      redirect: "follow",
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    return parseGoogleHtml(html, num);
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === "AbortError") throw new Error(`google search timed out after ${opts.timeout}s`);
+    throw new Error(`google search failed: ${e.message}`);
+  }
+}
+
+// --- Baidu search ---
+
+function parseBaiduHtml(html, num) {
+  const results = [];
+  // Baidu results: <div class="result c-container ..."> with <h3 class="t"><a href="...">Title</a></h3>
+  const blockRegex = /<div[^>]+class="[^"]*result[^"]*c-container[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<!--/gi;
+  // Fallback: simpler pattern
+  const blockRegex2 = /<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+
+  const blocks = [...html.matchAll(blockRegex2)];
+  for (let i = 0; i < Math.min(blocks.length, num); i++) {
+    const url = blocks[i][1];
+    const title = blocks[i][2].replace(/<[^>]*>/g, "").replace(/&[^;]+;/g, "").trim();
+
+    // Baidu uses redirect URLs, the real URL is resolved on click
+    // We keep the baidu redirect URL as-is since resolving requires following redirects
+    if (url && title) {
+      results.push({ title, url, abstract: "" });
+    }
+  }
+
+  return results;
+}
+
+async function baiduSearch(query, num) {
+  const timeout = parseInt(opts.timeout, 10) * 1000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const params = new URLSearchParams({ wd: query, rn: String(num) });
+    const res = await fetch(`https://www.baidu.com/s?${params}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      },
+      signal: controller.signal,
+      redirect: "follow",
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    return parseBaiduHtml(html, num);
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === "AbortError") throw new Error(`baidu search timed out after ${opts.timeout}s`);
+    throw new Error(`baidu search failed: ${e.message}`);
+  }
+}
+
+// --- Auto engine detection ---
+
+async function probeDdg() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DDG_PROBE_TIMEOUT);
+
+  try {
+    const res = await fetch("https://html.duckduckgo.com/html/", {
+      method: "HEAD",
+      signal: controller.signal,
+      redirect: "follow",
+    });
+    clearTimeout(timer);
+    return res.ok;
+  } catch {
+    clearTimeout(timer);
+    return false;
+  }
+}
+
+async function resolveEngine(engine) {
+  if (engine !== "auto") return engine;
+
+  info(`${c.dim}probing DuckDuckGo availability...${c.reset}`);
+  const ddgOk = await probeDdg();
+  if (ddgOk) {
+    info(`${c.dim}DuckDuckGo reachable, using duckduckgo engine${c.reset}`);
+    return "duckduckgo";
+  }
+  info(`${c.dim}DuckDuckGo unreachable, falling back to bing${c.reset}`);
+  return "bing";
+}
+
+async function searchWith(engine, query, num) {
+  switch (engine) {
+    case "duckduckgo": return ddgSearch(query, num);
+    case "bing": return bingSearch(query, num);
+    case "google": return googleSearch(query, num);
+    case "baidu": return baiduSearch(query, num);
+    default: die(`unknown engine: ${engine} (supported: ${SUPPORTED_ENGINES.join(", ")})`);
+  }
+}
+
 function formatSearchResults(results) {
   return results
     .map(
@@ -349,11 +570,17 @@ function formatSearchResultsRaw(results) {
 
 if (opts.search) {
   const num = parseInt(opts.num, 10);
-  info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset}`);
+  const engineArg = opts.engine.toLowerCase();
+  if (!SUPPORTED_ENGINES.includes(engineArg)) {
+    die(`unknown engine: ${engineArg} (supported: ${SUPPORTED_ENGINES.join(", ")})`);
+  }
+
+  const engine = await resolveEngine(engineArg);
+  info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset} ${c.dim}(${engine})${c.reset}`);
 
   let results;
   try {
-    results = await ddgSearch(opts.search, num);
+    results = await searchWith(engine, opts.search, num);
   } catch (e) {
     die(e.message);
   }

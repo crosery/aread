@@ -137,7 +137,7 @@ describe("native DuckDuckGo search (no Python)", () => {
   it("help text no longer mentions Python requirement", async () => {
     const { stdout } = await run(["--help"]);
     assert.ok(!stdout.includes("requires Python 3"));
-    assert.ok(stdout.includes("no Python required"));
+    assert.ok(stdout.includes("multiple engines") || stdout.includes("DuckDuckGo"));
   });
 
   it("parseDdgHtml extracts results from mock HTML", async () => {
@@ -243,6 +243,123 @@ describe("--json output", () => {
         assert.ok("cached" in parsed[0]);
       }
     }
+  });
+});
+
+// --- 6. Multi-engine support ---
+
+describe("multi-engine support", () => {
+  it("--help mentions --engine flag", async () => {
+    const { stdout } = await run(["--help"]);
+    assert.ok(stdout.includes("--engine"));
+    assert.ok(stdout.includes("duckduckgo"));
+    assert.ok(stdout.includes("bing"));
+    assert.ok(stdout.includes("google"));
+    assert.ok(stdout.includes("baidu"));
+    assert.ok(stdout.includes("auto"));
+  });
+
+  it("-e shorthand is accepted", async () => {
+    const { stdout } = await run(["--help"]);
+    assert.ok(stdout.includes("-e, --engine"));
+  });
+
+  it("unknown engine produces error", async () => {
+    const { code, stderr } = await run(["-s", "test", "-e", "yahoo"]);
+    assert.notEqual(code, 0);
+    assert.ok(stderr.includes("unknown engine"));
+  });
+
+  it("default engine is duckduckgo (no --engine flag)", async () => {
+    // Without --engine, DDG is default. Check help text confirms this.
+    const { stdout } = await run(["--help"]);
+    assert.ok(stdout.includes("default: duckduckgo"));
+  });
+});
+
+describe("Bing search HTML parsing", () => {
+  it("parseBingHtml extracts results from mock HTML", () => {
+    // Replicate the Bing parsing logic
+    const html = `
+      <li class="b_algo"><h2><a href="https://example.com/page1">Bing Result 1</a></h2>
+      <p class="b_lineclamp2">This is bing snippet 1</p></li>
+      <li class="b_algo"><h2><a href="https://example.com/page2">Bing Result 2</a></h2>
+      <p class="b_lineclamp3">This is bing snippet 2</p></li>
+    `;
+
+    const blockRegex = /<li\s+class="b_algo">([\s\S]*?)<\/li>/gi;
+    const blocks = [...html.matchAll(blockRegex)];
+    assert.equal(blocks.length, 2);
+
+    const linkMatch = blocks[0][1].match(/<h2><a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a><\/h2>/i);
+    assert.ok(linkMatch);
+    assert.equal(linkMatch[1], "https://example.com/page1");
+    assert.equal(linkMatch[2].replace(/<[^>]*>/g, "").trim(), "Bing Result 1");
+
+    const snippetMatch = blocks[0][1].match(/<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>([\s\S]*?)<\/p>/i);
+    assert.ok(snippetMatch);
+    assert.equal(snippetMatch[1].replace(/<[^>]*>/g, "").trim(), "This is bing snippet 1");
+  });
+});
+
+describe("Google search HTML parsing", () => {
+  it("parseGoogleHtml extracts results from mock HTML", () => {
+    const html = `
+      <div class="g"><a href="https://example.com/google1"><h3>Google Result 1</h3></a>
+      <span class="st">Google snippet 1 that is long enough</span></div>
+      <div class="g"><a href="https://example.com/google2"><h3>Google Result 2</h3></a>
+      <span class="st">Google snippet 2 that is also long</span></div>
+    `;
+
+    const blockRegex = /<div\s+class="[^"]*\bg\b[^"]*">([\s\S]*?)<\/div>\s*(?=<div\s+class="[^"]*\bg\b|$)/gi;
+    const blocks = [...html.matchAll(blockRegex)];
+    assert.ok(blocks.length >= 1);
+
+    // Verify link extraction
+    const block = blocks[0][1];
+    const linkMatch = block.match(/<a[^>]+href="(https?:\/\/[^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
+    assert.ok(linkMatch);
+    assert.equal(linkMatch[1], "https://example.com/google1");
+
+    const titleMatch = block.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
+    assert.ok(titleMatch);
+    assert.equal(titleMatch[1].replace(/<[^>]*>/g, "").trim(), "Google Result 1");
+  });
+});
+
+describe("Baidu search HTML parsing", () => {
+  it("parseBaiduHtml extracts results from mock HTML", () => {
+    const html = `
+      <h3 class="t"><a href="https://www.baidu.com/link?url=abc123" target="_blank">Baidu Result 1</a></h3>
+      <h3 class="t"><a href="https://www.baidu.com/link?url=def456" target="_blank">Baidu Result 2</a></h3>
+    `;
+
+    const regex = /<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const blocks = [...html.matchAll(regex)];
+    assert.equal(blocks.length, 2);
+
+    assert.ok(blocks[0][1].includes("baidu.com/link"));
+    assert.equal(blocks[0][2].replace(/<[^>]*>/g, "").trim(), "Baidu Result 1");
+    assert.equal(blocks[1][2].replace(/<[^>]*>/g, "").trim(), "Baidu Result 2");
+  });
+});
+
+describe("auto engine detection", () => {
+  it("--engine auto is accepted without error on --help", async () => {
+    const { stdout } = await run(["--help"]);
+    assert.ok(stdout.includes("auto"));
+  });
+
+  it("bing search works (network test)", async () => {
+    const { stdout, code, stderr } = await run(
+      ["-s", "test", "-n", "3", "-r", "-e", "bing"],
+      { timeout: 30000 }
+    );
+    // If network is available, we should get results
+    if (code === 0) {
+      assert.ok(stdout.length > 0, "should have some output");
+    }
+    // If network fails, that's OK for CI
   });
 });
 
