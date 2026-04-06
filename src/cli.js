@@ -89,8 +89,8 @@ ${c.bold}READ OPTIONS${c.reset}
 ${c.bold}SEARCH OPTIONS${c.reset}
     -s, --search <QUERY>       Search the web
     -n, --num <N>              Number of search results (default: 10)
-    -e, --engine <ENGINE>      Search engine: duckduckgo|bing|google|baidu|auto
-                               (default: duckduckgo, auto probes DDG then falls back to Bing)
+    -e, --engine <ENGINE>      Search engine: auto|duckduckgo|bing|google|baidu
+                               (default: auto, probes DDG then falls back to Bing)
     --read                     Also fetch each result as Markdown
     -c, --concurrency <N>      Concurrent reads (default: 5, with --read)
 
@@ -141,7 +141,7 @@ try {
       header: { type: "string", short: "H", multiple: true, default: [] },
       search: { type: "string", short: "s" },
       num: { type: "string", short: "n", default: "10" },
-      engine: { type: "string", short: "e", default: "duckduckgo" },
+      engine: { type: "string", short: "e", default: "auto" },
       read: { type: "boolean", default: false },
       "no-cache": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
