@@ -28,5 +28,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/crosery/jread.git"
+  },
+  "dependencies": {
+    "turndown": "^7.2.4"
   }
 }
