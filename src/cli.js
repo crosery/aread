@@ -1,39 +1,26 @@
 #!/usr/bin/env node
 
 import { parseArgs } from "node:util";
-import { writeFile, mkdir, access, chmod } from "node:fs/promises";
-import { execFile, execFileSync, spawnSync } from "node:child_process";
+import { writeFile, readFile, mkdir } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
+import { createHash } from "node:crypto";
 
 // Windows encoding fix
 if (platform() === "win32") {
-  // Method 1: chcp 65001 (works on most Windows 10+)
   spawnSync("chcp", ["65001"], { shell: true, stdio: "ignore" });
-
-  // Method 2: PowerShell - set .NET console encoding (more reliable)
   spawnSync("powershell", [
     "-NoProfile", "-Command",
     "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::InputEncoding = [System.Text.Encoding]::UTF8"
   ], { stdio: "ignore" });
-
-  // Method 3: ensure Node writes UTF-8 BOM-less output
   if (process.stdout._handle && process.stdout._handle.setBlocking) {
     process.stdout._handle.setBlocking(true);
   }
-
-  // Ensure ddgr subprocess also outputs UTF-8
-  process.env.PYTHONIOENCODING = "utf-8";
 }
 
 const VERSION = "1.2.3";
 const JINA_READ = "https://r.jina.ai";
-const DDGR_VERSION = "2.2";
-const DDGR_URLS = [
-  `https://raw.githubusercontent.com/jarun/ddgr/v${DDGR_VERSION}/ddgr`,
-  `https://cdn.jsdelivr.net/gh/jarun/ddgr@v${DDGR_VERSION}/ddgr`,
-  `https://gitee.com/mirrors/ddgr/raw/v${DDGR_VERSION}/ddgr`,
-];
 
 // --- Colors (auto-detect TTY) ---
 
@@ -61,41 +48,26 @@ function info(msg) {
   process.stderr.write(`${msg}\n`);
 }
 
-function exec(cmd, args, timeout = 30000) {
-  return new Promise((resolve, reject) => {
-    const env = { ...process.env, PYTHONIOENCODING: "utf-8", LANG: "en_US.UTF-8" };
-    execFile(cmd, args, { maxBuffer: 10 * 1024 * 1024, timeout, encoding: "utf-8", env }, (err, stdout, stderr) => {
-      if (err) {
-        err.stderr = stderr;
-        reject(err);
-      } else resolve(stdout);
-    });
-  });
+function urlHash(url) {
+  return createHash("sha256").update(url).digest("hex");
 }
 
-async function fileExists(path) {
+async function getCachedContent(url) {
+  if (opts && opts["no-cache"]) return null;
+  const cacheDir = getCacheDir();
+  const cachePath = join(cacheDir, urlHash(url) + ".md");
   try {
-    await access(path);
-    return true;
+    return await readFile(cachePath, "utf-8");
   } catch {
-    return false;
+    return null;
   }
 }
 
-function cmdExists(cmd) {
-  try {
-    execFileSync(platform() === "win32" ? "where" : "which", [cmd], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function findPython() {
-  for (const cmd of platform() === "win32" ? ["python", "python3", "py"] : ["python3", "python"]) {
-    if (cmdExists(cmd)) return cmd;
-  }
-  return null;
+async function setCachedContent(url, content) {
+  const cacheDir = getCacheDir();
+  await mkdir(cacheDir, { recursive: true });
+  const cachePath = join(cacheDir, urlHash(url) + ".md");
+  await writeFile(cachePath, content, "utf-8");
 }
 
 function printHelp() {
@@ -116,8 +88,11 @@ ${c.bold}SEARCH OPTIONS${c.reset}
     -s, --search <QUERY>       Search via DuckDuckGo
     -n, --num <N>              Number of search results (default: 10)
     --read                     Also fetch each result as Markdown
+    -c, --concurrency <N>      Concurrent reads (default: 5, with --read)
 
 ${c.bold}GENERAL${c.reset}
+    --no-cache                 Skip URL cache
+    --json                     Output structured JSON
     -h, --help                 Show this help
     -v, --version              Show version
 
@@ -144,8 +119,8 @@ ${c.bold}INSTALL${c.reset}
     npx aread-cli <URL>
 
 ${c.bold}NOTE${c.reset}
-    Search requires Python 3. First search auto-downloads ddgr to cache.
-    Reading works without Python.`);
+    Search uses DuckDuckGo natively (no Python required).
+    Jina API is used for reading; falls back to local fetch + turndown.`);
 }
 
 // --- Parse args ---
@@ -162,6 +137,9 @@ try {
       search: { type: "string", short: "s" },
       num: { type: "string", short: "n", default: "10" },
       read: { type: "boolean", default: false },
+      "no-cache": { type: "boolean", default: false },
+      json: { type: "boolean", default: false },
+      concurrency: { type: "string", short: "c", default: "5" },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
     },
@@ -214,7 +192,77 @@ async function jinaFetch(url) {
   return body;
 }
 
-// --- ddgr management ---
+// --- Fallback: local HTML fetch + turndown ---
+
+async function localFetch(url) {
+  const timeout = parseInt(opts.timeout, 10) * 1000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  const res = await fetch(url, {
+    signal: controller.signal,
+    redirect: "follow",
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; aread/1.0)" },
+  });
+  clearTimeout(timer);
+
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  const html = await res.text();
+
+  let TurndownService;
+  try {
+    TurndownService = (await import("turndown")).default;
+  } catch {
+    throw new Error("turndown not installed. Run: npm i turndown");
+  }
+
+  const td = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+  return td.turndown(html);
+}
+
+async function fetchWithFallback(url) {
+  // Check cache first
+  const cached = await getCachedContent(url);
+  if (cached) return { markdown: cached, cached: true };
+
+  try {
+    const md = await jinaFetch(url);
+    await setCachedContent(url, md);
+    return { markdown: md, cached: false };
+  } catch (jinaErr) {
+    info(`${c.dim}jina failed, trying local fallback...${c.reset}`);
+    try {
+      const md = await localFetch(url);
+      await setCachedContent(url, md);
+      return { markdown: md, cached: false };
+    } catch (localErr) {
+      throw new Error(`jina: ${jinaErr.message}; local: ${localErr.message}`);
+    }
+  }
+}
+
+// --- Concurrency helper ---
+
+async function mapConcurrent(items, concurrency, fn) {
+  const results = new Array(items.length);
+  let idx = 0;
+
+  async function worker() {
+    while (idx < items.length) {
+      const i = idx++;
+      results[i] = await fn(items[i], i).then(
+        (v) => ({ status: "fulfilled", value: v }),
+        (e) => ({ status: "rejected", reason: e })
+      );
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+// --- Cache directory ---
 
 function getCacheDir() {
   const home = homedir();
@@ -224,75 +272,61 @@ function getCacheDir() {
   return join(process.env.XDG_CACHE_HOME || join(home, ".cache"), "aread");
 }
 
-async function downloadWithFallback(urls, dest) {
-  for (const url of urls) {
+// --- DuckDuckGo search (native, no Python) ---
+
+function parseDdgHtml(html, num) {
+  const results = [];
+  const regex = /<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const snippetRegex = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
+
+  const links = [...html.matchAll(regex)];
+  const snippets = [...html.matchAll(snippetRegex)];
+
+  for (let i = 0; i < Math.min(links.length, num); i++) {
+    const rawUrl = links[i][1];
+    const title = links[i][2].replace(/<[^>]*>/g, "").trim();
+    const abstract = snippets[i] ? snippets[i][1].replace(/<[^>]*>/g, "").trim() : "";
+
+    // DuckDuckGo redirects through uddg param
+    let url = rawUrl;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15000);
-      const res = await fetch(url, { signal: controller.signal, redirect: "follow" });
-      clearTimeout(timer);
-      if (res.ok) {
-        const text = await res.text();
-        if (text.startsWith("#!/")) {
-          await writeFile(dest, text, "utf-8");
-          return true;
-        }
-      }
+      const u = new URL(rawUrl, "https://duckduckgo.com");
+      const uddg = u.searchParams.get("uddg");
+      if (uddg) url = decodeURIComponent(uddg);
     } catch {}
+
+    if (url && title) results.push({ title, url, abstract });
   }
-  return false;
+
+  return results;
 }
-
-async function ensureDdgr() {
-  // 1. Check system ddgr
-  if (cmdExists("ddgr")) return { cmd: "ddgr", args: [] };
-
-  // 2. Check cached ddgr
-  const cacheDir = getCacheDir();
-  const ddgrPath = join(cacheDir, "ddgr");
-  const python = findPython();
-
-  if (await fileExists(ddgrPath)) {
-    if (!python) die("Python 3 is required for search. Install from https://python.org");
-    return { cmd: python, args: [ddgrPath] };
-  }
-
-  // 3. Download ddgr
-  if (!python) die("Python 3 is required for search. Install from https://python.org");
-
-  info(`${c.dim}first run: downloading ddgr search engine (~60KB)...${c.reset}`);
-  await mkdir(cacheDir, { recursive: true });
-
-  const ok = await downloadWithFallback(DDGR_URLS, ddgrPath);
-  if (!ok) {
-    die(
-      `failed to download ddgr. Install it manually:\n` +
-        `       ${c.dim}arch:${c.reset}   pacman -S ddgr\n` +
-        `       ${c.dim}mac:${c.reset}    brew install ddgr\n` +
-        `       ${c.dim}pip:${c.reset}    pip install ddgr\n` +
-        `       ${c.dim}win:${c.reset}    pip install ddgr`
-    );
-  }
-
-  if (platform() !== "win32") await chmod(ddgrPath, 0o755);
-
-  info(`${c.green}done${c.reset} ${c.dim}(cached at ${ddgrPath})${c.reset}\n`);
-  return { cmd: python, args: [ddgrPath] };
-}
-
-// --- DuckDuckGo search ---
 
 async function ddgSearch(query, num) {
-  const { cmd, args: baseArgs } = await ensureDdgr();
   const timeout = parseInt(opts.timeout, 10) * 1000;
-  const args = [...baseArgs, "--json", "-n", String(num), query];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
-    const stdout = await exec(cmd, args, timeout);
-    return JSON.parse(stdout);
+    const params = new URLSearchParams({ q: query, kl: "", df: "" });
+    const res = await fetch("https://html.duckduckgo.com/html/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (compatible; aread/1.0)",
+      },
+      body: params.toString(),
+      signal: controller.signal,
+      redirect: "follow",
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) die(`search failed: HTTP ${res.status}`);
+    const html = await res.text();
+    return parseDdgHtml(html, num);
   } catch (e) {
-    if (e.killed) die(`search timed out after ${opts.timeout}s`);
-    die(`search failed: ${e.message}${e.stderr ? "\n       " + e.stderr.trim() : ""}`);
+    clearTimeout(timer);
+    if (e.name === "AbortError") die(`search timed out after ${opts.timeout}s`);
+    die(`search failed: ${e.message}`);
   }
 }
 
@@ -331,28 +365,54 @@ if (opts.search) {
   info(`${c.dim}found ${results.length} results${c.reset}\n`);
 
   if (opts.read) {
-    info(`${c.dim}reading ${results.length} pages...${c.reset}\n`);
+    const concurrency = parseInt(opts.concurrency, 10) || 5;
+    info(`${c.dim}reading ${results.length} pages (concurrency: ${concurrency})...${c.reset}\n`);
 
-    const parts = [];
-    for (const [i, r] of results.entries()) {
+    const settled = await mapConcurrent(results, concurrency, async (r, i) => {
       info(`${c.dim}[${i + 1}/${results.length}]${c.reset} ${c.cyan}${r.url}${c.reset}`);
-      try {
-        const md = await jinaFetch(r.url);
-        parts.push(`---\n\n## ${i + 1}. ${r.title}\n\n> Source: ${r.url}\n\n${md}`);
-      } catch {
-        parts.push(`---\n\n## ${i + 1}. ${r.title}\n\n> Source: ${r.url}\n\n*Failed to fetch*`);
+      const { markdown, cached: wasCached } = await fetchWithFallback(r.url);
+      return { index: i, title: r.title, url: r.url, markdown, cached: wasCached };
+    });
+
+    if (opts.json) {
+      const jsonResults = settled.map((s, i) => {
+        if (s.status === "fulfilled") {
+          return { url: s.value.url, title: s.value.title, markdown: s.value.markdown, cached: s.value.cached, error: null };
+        }
+        return { url: results[i].url, title: results[i].title, markdown: null, cached: false, error: s.reason.message };
+      });
+      const jsonOutput = JSON.stringify(jsonResults, null, 2);
+      if (opts.output) {
+        await writeFile(opts.output, jsonOutput, "utf-8");
+        info(`\n${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset}`);
+      } else {
+        process.stdout.write(jsonOutput + "\n");
+      }
+    } else {
+      const parts = settled.map((s, i) => {
+        if (s.status === "fulfilled") {
+          const v = s.value;
+          return `---\n\n## ${i + 1}. ${v.title}\n\n> Source: ${v.url}\n\n${v.markdown}`;
+        }
+        return `---\n\n## ${i + 1}. ${results[i].title}\n\n> Source: ${results[i].url}\n\n*Failed to fetch*`;
+      });
+
+      const output = parts.join("\n\n");
+      if (opts.output) {
+        await writeFile(opts.output, output, "utf-8");
+        info(`\n${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(output)} bytes)${c.reset}`);
+      } else {
+        process.stdout.write(output);
+        if (!output.endsWith("\n")) process.stdout.write("\n");
       }
     }
-
-    const output = parts.join("\n\n");
+  } else if (opts.json) {
+    const jsonOutput = JSON.stringify(results, null, 2);
     if (opts.output) {
-      await writeFile(opts.output, output, "utf-8");
-      info(
-        `\n${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(output)} bytes)${c.reset}`
-      );
+      await writeFile(opts.output, jsonOutput, "utf-8");
+      info(`${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset}`);
     } else {
-      process.stdout.write(output);
-      if (!output.endsWith("\n")) process.stdout.write("\n");
+      process.stdout.write(jsonOutput + "\n");
     }
   } else {
     const output = raw ? formatSearchResultsRaw(results) : formatSearchResults(results);
@@ -371,16 +431,27 @@ if (opts.search) {
   info(`${c.dim}fetching${c.reset} ${c.cyan}${url}${c.reset}`);
 
   try {
-    const body = await jinaFetch(url);
+    const { markdown: body, cached: wasCached } = await fetchWithFallback(url);
+    if (wasCached) info(`${c.dim}(from cache)${c.reset}`);
 
-    if (opts.output) {
-      await writeFile(opts.output, body, "utf-8");
-      info(
-        `${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(body)} bytes)${c.reset}`
-      );
+    if (opts.json) {
+      const jsonOutput = JSON.stringify({ url, title: null, markdown: body, cached: wasCached, error: null }, null, 2);
+      if (opts.output) {
+        await writeFile(opts.output, jsonOutput, "utf-8");
+        info(`${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset}`);
+      } else {
+        process.stdout.write(jsonOutput + "\n");
+      }
     } else {
-      process.stdout.write(body);
-      if (!body.endsWith("\n")) process.stdout.write("\n");
+      if (opts.output) {
+        await writeFile(opts.output, body, "utf-8");
+        info(
+          `${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(body)} bytes)${c.reset}`
+        );
+      } else {
+        process.stdout.write(body);
+        if (!body.endsWith("\n")) process.stdout.write("\n");
+      }
     }
   } catch (e) {
     if (e.name === "AbortError") die(`request timed out after ${opts.timeout}s`);
