@@ -22,7 +22,13 @@ if (platform() === "win32") {
 const VERSION = "1.3.1";
 const JINA_READ = "https://r.jina.ai";
 const SUPPORTED_ENGINES = ["duckduckgo", "bing", "google", "baidu", "auto"];
-const DDG_PROBE_TIMEOUT = 3000;
+// Probe DDG with a tight timeout — in networks where DDG is blocked
+// (e.g. mainland China), waiting longer just delays the inevitable bing fallback.
+const DDG_PROBE_TIMEOUT = 1500;
+// Hard cap on a single search engine HTTP call. Independent of --timeout
+// (which controls page-read fetches). Search must fail fast: an unreachable
+// engine should yield to fallback within seconds, not 30s.
+const SEARCH_TIMEOUT_MS = 8000;
 
 // --- Colors (auto-detect TTY) ---
 
@@ -314,9 +320,8 @@ function parseDdgHtml(html, num) {
 }
 
 async function ddgSearch(query, num) {
-  const timeout = parseInt(opts.timeout, 10) * 1000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
 
   try {
     const params = new URLSearchParams({ q: query });
@@ -336,7 +341,7 @@ async function ddgSearch(query, num) {
     return parseDdgHtml(html, num);
   } catch (e) {
     clearTimeout(timer);
-    if (e.name === "AbortError") throw new Error(`duckduckgo search timed out after ${opts.timeout}s`);
+    if (e.name === "AbortError") throw new Error(`duckduckgo search timed out after ${SEARCH_TIMEOUT_MS / 1000}s`);
     throw new Error(`duckduckgo search failed: ${e.message}`);
   }
 }
@@ -379,9 +384,8 @@ function parseBingHtml(html, num) {
 }
 
 async function bingSearch(query, num) {
-  const timeout = parseInt(opts.timeout, 10) * 1000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
 
   try {
     // Use mkt=en-US to avoid cn.bing.com redirect returning only Zhihu results
@@ -401,7 +405,7 @@ async function bingSearch(query, num) {
     return parseBingHtml(html, num);
   } catch (e) {
     clearTimeout(timer);
-    if (e.name === "AbortError") throw new Error(`bing search timed out after ${opts.timeout}s`);
+    if (e.name === "AbortError") throw new Error(`bing search timed out after ${SEARCH_TIMEOUT_MS / 1000}s`);
     throw new Error(`bing search failed: ${e.message}`);
   }
 }
@@ -462,9 +466,8 @@ function parseGoogleHtml(html, num) {
 }
 
 async function googleSearch(query, num) {
-  const timeout = parseInt(opts.timeout, 10) * 1000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
 
   try {
     const params = new URLSearchParams({ q: query, num: String(num), hl: "en" });
@@ -483,7 +486,7 @@ async function googleSearch(query, num) {
     return parseGoogleHtml(html, num);
   } catch (e) {
     clearTimeout(timer);
-    if (e.name === "AbortError") throw new Error(`google search timed out after ${opts.timeout}s`);
+    if (e.name === "AbortError") throw new Error(`google search timed out after ${SEARCH_TIMEOUT_MS / 1000}s`);
     throw new Error(`google search failed: ${e.message}`);
   }
 }
@@ -556,7 +559,6 @@ async function resolveBaiduUrls(results, { resolve = false, timeoutMs = 2000 } =
 }
 
 async function baiduSearch(query, num) {
-  const timeout = parseInt(opts.timeout, 10) * 1000;
   const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
   // Baidu requires cookies to avoid security verification page.
@@ -576,7 +578,7 @@ async function baiduSearch(query, num) {
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
 
   try {
     const params = new URLSearchParams({ wd: query, rn: String(num) });
@@ -607,7 +609,7 @@ async function baiduSearch(query, num) {
     return resolveBaiduUrls(results, { resolve: opts["resolve-redirects"] });
   } catch (e) {
     clearTimeout(timer);
-    if (e.name === "AbortError") throw new Error(`baidu search timed out after ${opts.timeout}s`);
+    if (e.name === "AbortError") throw new Error(`baidu search timed out after ${SEARCH_TIMEOUT_MS / 1000}s`);
     throw new Error(`baidu search failed: ${e.message}`);
   }
 }
@@ -675,7 +677,10 @@ async function searchWithFallback(engine, query, num) {
 
 // --- Multi-engine aggregate search ---
 
-const MULTI_ENGINES = ["bing", "google", "baidu", "duckduckgo"];
+// Default multi-engine set: Bing/DDG/Baidu cover all common environments.
+// Google is excluded by default — it aggressively blocks scrapers and overlaps
+// heavily with Bing. Users with verified Google access can still use --engine google.
+const MULTI_ENGINES = ["bing", "duckduckgo", "baidu"];
 
 async function multiEngineSearch(query, num) {
   info(`${c.dim}multi-engine search: querying ${MULTI_ENGINES.join(", ")}...${c.reset}`);
