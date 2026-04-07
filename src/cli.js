@@ -93,6 +93,7 @@ ${c.bold}SEARCH OPTIONS${c.reset}
                                (default: duckduckgo, auto probes DDG then falls back to Bing)
     -m, --multi                Query all engines concurrently, merge & deduplicate results
     --read                     Also fetch each result as Markdown
+    --resolve-redirects        Resolve Baidu redirect URLs to real targets (slower)
     -c, --concurrency <N>      Concurrent reads (default: 5, with --read)
 
 ${c.bold}GENERAL${c.reset}
@@ -150,6 +151,7 @@ try {
       json: { type: "boolean", default: false },
       concurrency: { type: "string", short: "c", default: "5" },
       multi: { type: "boolean", short: "m", default: false },
+      "resolve-redirects": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
     },
@@ -526,7 +528,10 @@ function parseBaiduHtml(html, num) {
 }
 
 // Resolve Baidu redirect URLs (baidu.com/link?url=...) to real target URLs
-async function resolveBaiduUrls(results) {
+// Skipped by default — AI agents can follow redirects via --read, and resolving
+// adds significant latency (HEAD request per result with up to 2s timeout each).
+async function resolveBaiduUrls(results, { resolve = false, timeoutMs = 2000 } = {}) {
+  if (!resolve) return results;
   const resolved = await Promise.all(
     results.map(async (r) => {
       if (!r.url.includes("baidu.com/link?")) return r;
@@ -535,7 +540,7 @@ async function resolveBaiduUrls(results) {
           method: "HEAD",
           redirect: "follow",
           headers: { "User-Agent": "Mozilla/5.0 (compatible; aread/1.0)" },
-          signal: AbortSignal.timeout(5000),
+          signal: AbortSignal.timeout(timeoutMs),
         });
         const realUrl = res.url;
         if (realUrl && !realUrl.includes("baidu.com/link?")) {
@@ -597,7 +602,7 @@ async function baiduSearch(query, num) {
     }
 
     const results = parseBaiduHtml(html, num);
-    return resolveBaiduUrls(results);
+    return resolveBaiduUrls(results, { resolve: opts["resolve-redirects"] });
   } catch (e) {
     clearTimeout(timer);
     if (e.name === "AbortError") throw new Error(`baidu search timed out after ${opts.timeout}s`);
