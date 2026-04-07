@@ -91,6 +91,7 @@ ${c.bold}SEARCH OPTIONS${c.reset}
     -n, --num <N>              Number of search results (default: 10)
     -e, --engine <ENGINE>      Search engine: duckduckgo|bing|google|baidu|auto
                                (default: duckduckgo, auto probes DDG then falls back to Bing)
+    -m, --multi                Query all engines concurrently, merge & deduplicate results
     --read                     Also fetch each result as Markdown
     -c, --concurrency <N>      Concurrent reads (default: 5, with --read)
 
@@ -108,6 +109,7 @@ ${c.bold}EXAMPLES${c.reset}
     aread -s "rust async tutorial"
     aread -s "react hooks" -n 3
     aread -s "node.js streams" --read
+    aread -s "rust async tutorial" --multi
     aread -H "X-With-Links:true" https://example.com
 
 ${c.bold}JINA HEADERS${c.reset}
@@ -125,6 +127,7 @@ ${c.bold}INSTALL${c.reset}
 ${c.bold}NOTE${c.reset}
     Search supports multiple engines (DuckDuckGo, Bing, Google, Baidu).
     Use --engine auto to probe DDG and fallback to Bing if unavailable.
+    Use --multi to query all engines concurrently and merge results.
     Jina API is used for reading; falls back to local fetch + turndown.`);
 }
 
@@ -146,6 +149,7 @@ try {
       "no-cache": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       concurrency: { type: "string", short: "c", default: "5" },
+      multi: { type: "boolean", short: "m", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
     },
@@ -325,13 +329,13 @@ async function ddgSearch(query, num) {
     });
     clearTimeout(timer);
 
-    if (!res.ok) die(`search failed: HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = await res.text();
     return parseDdgHtml(html, num);
   } catch (e) {
     clearTimeout(timer);
-    if (e.name === "AbortError") die(`search timed out after ${opts.timeout}s`);
-    die(`search failed: ${e.message}`);
+    if (e.name === "AbortError") throw new Error(`duckduckgo search timed out after ${opts.timeout}s`);
+    throw new Error(`duckduckgo search failed: ${e.message}`);
   }
 }
 
@@ -662,6 +666,51 @@ async function searchWithFallback(engine, query, num) {
   }
 }
 
+// --- Multi-engine aggregate search ---
+
+const MULTI_ENGINES = ["bing", "google", "baidu", "duckduckgo"];
+
+async function multiEngineSearch(query, num) {
+  info(`${c.dim}multi-engine search: querying ${MULTI_ENGINES.join(", ")}...${c.reset}`);
+
+  const settled = await Promise.allSettled(
+    MULTI_ENGINES.map((engine) => searchWith(engine, query, num))
+  );
+
+  const seenUrls = new Set();
+  const merged = [];
+
+  for (let i = 0; i < settled.length; i++) {
+    const result = settled[i];
+    if (result.status === "fulfilled" && Array.isArray(result.value)) {
+      info(`${c.dim}  ${MULTI_ENGINES[i]}: ${result.value.length} results${c.reset}`);
+      for (const item of result.value) {
+        const normalizedUrl = normalizeUrl(item.url);
+        if (!seenUrls.has(normalizedUrl)) {
+          seenUrls.add(normalizedUrl);
+          merged.push(item);
+        }
+      }
+    } else {
+      const reason = result.status === "rejected" ? result.reason.message : "no results";
+      info(`${c.dim}  ${MULTI_ENGINES[i]}: failed (${reason})${c.reset}`);
+    }
+  }
+
+  return merged;
+}
+
+function normalizeUrl(url) {
+  try {
+    const u = new URL(url);
+    // Remove trailing slash, lowercase host
+    let normalized = u.origin.toLowerCase() + u.pathname.replace(/\/+$/, "") + u.search;
+    return normalized;
+  } catch {
+    return url;
+  }
+}
+
 async function searchWith(engine, query, num) {
   switch (engine) {
     case "duckduckgo": return ddgSearch(query, num);
@@ -691,19 +740,30 @@ function formatSearchResultsRaw(results) {
 
 if (opts.search) {
   const num = parseInt(opts.num, 10);
-  const engineArg = opts.engine.toLowerCase();
-  if (!SUPPORTED_ENGINES.includes(engineArg)) {
-    die(`unknown engine: ${engineArg} (supported: ${SUPPORTED_ENGINES.join(", ")})`);
-  }
-
-  const engine = await resolveEngine(engineArg);
-  info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset} ${c.dim}(${engine})${c.reset}`);
 
   let results;
-  try {
-    results = await searchWithFallback(engine, opts.search, num);
-  } catch (e) {
-    die(e.message);
+
+  if (opts.multi) {
+    info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset} ${c.dim}(multi-engine)${c.reset}`);
+    try {
+      results = await multiEngineSearch(opts.search, num);
+    } catch (e) {
+      die(e.message);
+    }
+  } else {
+    const engineArg = opts.engine.toLowerCase();
+    if (!SUPPORTED_ENGINES.includes(engineArg)) {
+      die(`unknown engine: ${engineArg} (supported: ${SUPPORTED_ENGINES.join(", ")})`);
+    }
+
+    const engine = await resolveEngine(engineArg);
+    info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset} ${c.dim}(${engine})${c.reset}`);
+
+    try {
+      results = await searchWithFallback(engine, opts.search, num);
+    } catch (e) {
+      die(e.message);
+    }
   }
 
   if (!results || results.length === 0) {

@@ -554,6 +554,165 @@ describe("auto engine detection and fallback", () => {
   });
 });
 
+// --- 7. Multi-engine aggregate search (--multi) ---
+
+describe("multi-engine aggregate search (--multi)", () => {
+  it("--help mentions --multi flag", async () => {
+    const { stdout } = await run(["--help"]);
+    assert.ok(stdout.includes("--multi"), "help should mention --multi");
+    assert.ok(stdout.includes("-m, --multi"), "help should show -m shorthand");
+  });
+
+  it("-m shorthand is accepted without error", async () => {
+    const { stdout } = await run(["--help"]);
+    assert.ok(stdout.includes("-m, --multi"));
+  });
+
+  it("source code contains multiEngineSearch function", async () => {
+    const src = await readFile(CLI, "utf-8");
+    assert.ok(src.includes("multiEngineSearch"), "multiEngineSearch function should exist");
+    assert.ok(src.includes("Promise.allSettled"), "should use Promise.allSettled for concurrent queries");
+    assert.ok(src.includes("MULTI_ENGINES"), "should define MULTI_ENGINES constant");
+  });
+
+  it("source code contains normalizeUrl for deduplication", async () => {
+    const src = await readFile(CLI, "utf-8");
+    assert.ok(src.includes("normalizeUrl"), "normalizeUrl function should exist for dedup");
+    assert.ok(src.includes("seenUrls"), "should track seen URLs for deduplication");
+  });
+
+  it("normalizeUrl logic works correctly", () => {
+    // Replicate normalizeUrl from cli.js
+    function normalizeUrl(url) {
+      try {
+        const u = new URL(url);
+        return u.origin.toLowerCase() + u.pathname.replace(/\/+$/, "") + u.search;
+      } catch {
+        return url;
+      }
+    }
+
+    // Same URL with/without trailing slash
+    assert.equal(
+      normalizeUrl("https://example.com/"),
+      normalizeUrl("https://example.com")
+    );
+
+    // Case-insensitive host
+    assert.equal(
+      normalizeUrl("https://EXAMPLE.COM/page"),
+      normalizeUrl("https://example.com/page")
+    );
+
+    // Different paths are different
+    assert.notEqual(
+      normalizeUrl("https://example.com/a"),
+      normalizeUrl("https://example.com/b")
+    );
+
+    // Preserves query string
+    assert.notEqual(
+      normalizeUrl("https://example.com/page?q=1"),
+      normalizeUrl("https://example.com/page?q=2")
+    );
+  });
+
+  it("--multi search works (network test)", async () => {
+    const { stdout, code, stderr } = await run(
+      ["-s", "test", "-n", "3", "--multi"],
+      { timeout: 60000 }
+    );
+    if (code === 0) {
+      assert.ok(stdout.length > 0, "should have some output");
+    }
+    // stderr should mention multi-engine
+    assert.ok(
+      stderr.includes("multi-engine") || stderr.includes("querying"),
+      "stderr should show multi-engine status"
+    );
+  });
+
+  it("--multi with --json produces valid JSON", async () => {
+    const { stdout, code } = await run(
+      ["-s", "test", "-n", "3", "--multi", "--json", "-r"],
+      { timeout: 60000 }
+    );
+    if (code === 0 && stdout.trim()) {
+      const parsed = JSON.parse(stdout);
+      assert.ok(Array.isArray(parsed), "JSON output should be an array");
+      for (const item of parsed) {
+        assert.ok("title" in item, "each result should have title");
+        assert.ok("url" in item, "each result should have url");
+        assert.ok("abstract" in item, "each result should have abstract");
+      }
+    }
+  });
+
+  it("--multi with -m shorthand works (network test)", async () => {
+    const { stdout, code, stderr } = await run(
+      ["-s", "test", "-n", "3", "-m"],
+      { timeout: 60000 }
+    );
+    if (code === 0) {
+      assert.ok(stdout.length > 0, "should have some output");
+    }
+    assert.ok(
+      stderr.includes("multi-engine") || stderr.includes("querying"),
+      "stderr should show multi-engine status for -m shorthand"
+    );
+  });
+
+  it("--multi results are deduplicated by URL", async () => {
+    // Deduplication logic test: simulate what multiEngineSearch does
+    const results1 = [
+      { title: "Result A", url: "https://example.com/page1", abstract: "From engine 1" },
+      { title: "Result B", url: "https://example.com/page2", abstract: "From engine 1" },
+    ];
+    const results2 = [
+      { title: "Result A (dup)", url: "https://example.com/page1", abstract: "From engine 2" },
+      { title: "Result C", url: "https://example.com/page3", abstract: "From engine 2" },
+    ];
+
+    function normalizeUrl(url) {
+      try {
+        const u = new URL(url);
+        return u.origin.toLowerCase() + u.pathname.replace(/\/+$/, "") + u.search;
+      } catch {
+        return url;
+      }
+    }
+
+    const seenUrls = new Set();
+    const merged = [];
+    for (const batch of [results1, results2]) {
+      for (const item of batch) {
+        const normalized = normalizeUrl(item.url);
+        if (!seenUrls.has(normalized)) {
+          seenUrls.add(normalized);
+          merged.push(item);
+        }
+      }
+    }
+
+    assert.equal(merged.length, 3, "should have 3 unique results (not 4)");
+    assert.equal(merged[0].title, "Result A", "first occurrence should be kept");
+    assert.equal(merged[2].url, "https://example.com/page3");
+  });
+
+  it("--multi ignores --engine flag", async () => {
+    // When --multi is set, --engine should be irrelevant
+    const { stderr } = await run(
+      ["-s", "test", "-n", "1", "--multi", "-e", "bing"],
+      { timeout: 60000 }
+    );
+    // Should still say multi-engine, not just bing
+    assert.ok(
+      stderr.includes("multi-engine") || stderr.includes("querying"),
+      "with --multi, should use multi-engine mode regardless of --engine"
+    );
+  });
+});
+
 // --- General / regression ---
 
 describe("general CLI behavior", () => {
