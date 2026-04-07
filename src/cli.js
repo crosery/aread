@@ -561,11 +561,13 @@ async function baiduSearch(query, num) {
 
   // Baidu requires cookies to avoid security verification page.
   // First visit baidu.com homepage to obtain session cookies.
+  // Cap this prefetch at 3s — if Baidu's homepage is slow, fail fast and try search anyway.
   let cookieStr = "";
   try {
     const homeRes = await fetch("https://www.baidu.com/", {
       headers: { "User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
       redirect: "follow",
+      signal: AbortSignal.timeout(3000),
     });
     const setCookies = homeRes.headers.getSetCookie?.() || [];
     cookieStr = setCookies.map((c) => c.split(";")[0]).join("; ");
@@ -871,3 +873,8 @@ if (opts.search) {
     die(e.message);
   }
 }
+
+// Force-exit after main work completes. Node's global fetch (undici) keeps
+// HTTP keep-alive connections in a pool, which holds the event loop open for
+// several seconds after we're done. As a CLI tool, we want to exit immediately.
+process.exit(0);
