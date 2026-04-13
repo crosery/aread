@@ -704,7 +704,133 @@ async function localFetch(url) {
   return td.turndown(html);
 }
 
-// --- Zhihu-specific fetch (requires user cookie) ---
+// --- Browser cookie extraction (Chrome/Chromium on macOS) ---
+
+const CHROME_BROWSERS = [
+  { name: "Chrome",   dir: "Google/Chrome/",                  keychain: "Chrome Safe Storage" },
+  { name: "Arc",      dir: "Arc/User Data/",                  keychain: "Arc Safe Storage" },
+  { name: "Edge",     dir: "Microsoft Edge/",                 keychain: "Microsoft Edge Safe Storage" },
+  { name: "Brave",    dir: "BraveSoftware/Brave-Browser/",    keychain: "Brave Safe Storage" },
+  { name: "Chromium", dir: "chromium/",                       keychain: "Chromium Safe Storage" },
+];
+
+function findChromeDbPath() {
+  if (platform() !== "darwin") return null; // macOS only for now
+  const base = join(homedir(), "Library", "Application Support");
+  for (const b of CHROME_BROWSERS) {
+    const dbPath = join(base, b.dir, "Default", "Cookies");
+    if (existsSync(dbPath)) return { dbPath, browser: b };
+  }
+  return null;
+}
+
+async function getKeychainPassword(service) {
+  return new Promise((resolve, reject) => {
+    const proc = spawnSync("security", ["find-generic-password", "-s", service, "-w"], {
+      timeout: 10000,
+      encoding: "utf-8",
+    });
+    if (proc.status !== 0) {
+      const err = (proc.stderr || "").trim();
+      if (err.includes("not be found")) reject(new Error(`No Keychain entry for "${service}"`));
+      else reject(new Error(`Keychain error: ${err}`));
+      return;
+    }
+    resolve(proc.stdout.trim());
+  });
+}
+
+function deriveKey(password, iterations) {
+  return createHash("sha1"); // placeholder — use proper pbkdf2
+}
+
+async function extractBrowserCookies(domain) {
+  const found = findChromeDbPath();
+  if (!found) return null;
+
+  const { dbPath, browser } = found;
+  info(`${c.dim}reading cookies from ${browser.name}...${c.reset}`);
+
+  // Get Keychain password and derive AES key
+  let keychainPassword;
+  try {
+    keychainPassword = await getKeychainPassword(browser.keychain);
+  } catch (e) {
+    info(`${c.dim}keychain access failed: ${e.message}${c.reset}`);
+    return null;
+  }
+
+  const { pbkdf2Sync, createDecipheriv } = await import("node:crypto");
+  const aesKey = pbkdf2Sync(keychainPassword, "saltysalt", 1003, 16, "sha1");
+
+  // Copy DB to avoid locking issues (Chrome may have it open)
+  const tmpDb = join("/tmp", `aread-cookies-${Date.now()}.db`);
+  const { copyFileSync, unlinkSync } = await import("node:fs");
+  try {
+    copyFileSync(dbPath, tmpDb);
+    if (existsSync(dbPath + "-wal")) copyFileSync(dbPath + "-wal", tmpDb + "-wal");
+    if (existsSync(dbPath + "-shm")) copyFileSync(dbPath + "-shm", tmpDb + "-shm");
+  } catch {
+    return null;
+  }
+
+  try {
+    // Query with sqlite3 CLI (zero dependency)
+    const domains = [domain, "." + domain];
+    // Include subdomains
+    const domainClauses = domains.map(d => `host_key = '${d.replace(/'/g, "''")}'`).join(" OR ");
+    const sql = `SELECT host_key, name, value, hex(encrypted_value) as ev_hex, path, expires_utc, is_secure, is_httponly FROM cookies WHERE (${domainClauses} OR host_key LIKE '%.${domain.replace(/'/g, "''")}') AND (has_expires = 0 OR expires_utc > ${Date.now() * 1000 + 11644473600000000});`;
+
+    const result = spawnSync("sqlite3", ["-json", tmpDb, sql], {
+      timeout: 5000,
+      encoding: "utf-8",
+    });
+
+    if (result.status !== 0) return null;
+    const rows = JSON.parse(result.stdout || "[]");
+    if (rows.length === 0) return null;
+
+    // Decrypt cookies and build cookie string
+    const cookieParts = [];
+    for (const row of rows) {
+      let value = row.value || "";
+
+      if (!value && row.ev_hex) {
+        try {
+          const ev = Buffer.from(row.ev_hex, "hex");
+          if (ev.length > 3) {
+            const prefix = ev.slice(0, 3).toString("utf-8");
+            if (prefix === "v10") {
+              const ciphertext = ev.slice(3);
+              const iv = Buffer.alloc(16, 0x20);
+              const decipher = createDecipheriv("aes-128-cbc", aesKey, iv);
+              const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+              if (plaintext.length > 32) {
+                value = plaintext.slice(32).toString("utf-8");
+              }
+            }
+          }
+        } catch {
+          continue; // skip failed decryption
+        }
+      }
+
+      if (value) {
+        cookieParts.push(`${row.name}=${value}`);
+      }
+    }
+
+    if (cookieParts.length === 0) return null;
+    info(`${c.green}✓${c.reset} ${c.dim}extracted ${cookieParts.length} cookies from ${browser.name}${c.reset}`);
+    return cookieParts.join("; ");
+  } finally {
+    try { unlinkSync(tmpDb); } catch {}
+    try { unlinkSync(tmpDb + "-wal"); } catch {}
+    try { unlinkSync(tmpDb + "-shm"); } catch {}
+  }
+}
+
+// --- Zhihu-specific fetch ---
 
 function isZhihuUrl(url) {
   try {
@@ -775,16 +901,19 @@ function extractZhihuContent(initialData, articleId, answerId) {
 }
 
 async function zhihuFetch(url) {
+  // Try: 1) manual config cookie  2) auto-extract from browser
   const config = await loadConfig();
-  const cookie = config.zhihu?.cookie;
+  let cookie = config.zhihu?.cookie;
+
+  if (!cookie) {
+    info(`${c.dim}no manual cookie configured, trying browser extraction...${c.reset}`);
+    cookie = await extractBrowserCookies("zhihu.com");
+  }
 
   if (!cookie) {
     throw new Error(
-      "Zhihu requires cookie authentication. Steps:\n" +
-      "  1. Open zhihu.com in your browser and log in\n" +
-      "  2. Open DevTools (F12) → Network tab → refresh the page\n" +
-      "  3. Click any request → copy the Cookie header value\n" +
-      "  4. Run: aread config set zhihu.cookie \"<paste cookie here>\""
+      "Zhihu requires cookies from your browser. On macOS, aread can auto-extract from Chrome — make sure you're logged in to zhihu.com.\n" +
+      "Or manually configure: aread config set zhihu.cookie \"<cookie from DevTools>\""
     );
   }
 
