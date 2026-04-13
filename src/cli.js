@@ -431,9 +431,11 @@ async function handleConfigCommand(args) {
     const config = await loadConfig();
     setNestedValue(config, key, value);
     await saveConfig(config);
-    // Mask apiKey in output
-    const display = key.toLowerCase().includes("apikey") || key.toLowerCase().includes("key")
-      ? value.slice(0, 6) + "..." + value.slice(-4)
+    // Mask sensitive values in output
+    const keyLower = key.toLowerCase();
+    const isSensitive = keyLower.includes("apikey") || keyLower.includes("key") || keyLower.includes("cookie");
+    const display = isSensitive
+      ? value.slice(0, 10) + "..." + ` (${value.length} chars)`
       : value;
     process.stderr.write(`${c.green}✓${c.reset} ${key} = ${display}\n`);
     return;
@@ -469,6 +471,10 @@ async function handleConfigCommand(args) {
         const k = display.ai.apiKey;
         display.ai.apiKey = k.slice(0, 6) + "..." + k.slice(-4);
       }
+      if (display.zhihu && display.zhihu.cookie) {
+        const ck = display.zhihu.cookie;
+        display.zhihu.cookie = ck.slice(0, 20) + "..." + ` (${ck.length} chars)`;
+      }
       console.log(JSON.stringify(display, null, 2));
     }
     process.stderr.write(`\n${c.dim}config: ${getConfigPath()}${c.reset}\n`);
@@ -502,6 +508,7 @@ ${c.bold}AI CONFIG KEYS${c.reset}
     ai.apiKey          API key
     ai.model           Model name (e.g. gpt-4o-mini, deepseek-chat, etc.)
     ai.autoSummarize   Auto-summarize on every fetch (true/false)
+    zhihu.cookie       Zhihu browser cookie (for fetching zhihu.com articles)
 
 ${c.bold}EXAMPLES${c.reset}
     aread config set ai.provider openrouter
@@ -697,10 +704,190 @@ async function localFetch(url) {
   return td.turndown(html);
 }
 
+// --- Zhihu-specific fetch (requires user cookie) ---
+
+function isZhihuUrl(url) {
+  try {
+    const host = new URL(url).hostname;
+    return host === "zhihu.com" || host.endsWith(".zhihu.com");
+  } catch {
+    return false;
+  }
+}
+
+function parseZhihuArticleId(url) {
+  // zhuanlan.zhihu.com/p/123456 or zhihu.com/p/123456
+  const match = url.match(/\/p\/(\d+)/);
+  return match ? match[1] : null;
+}
+
+function parseZhihuAnswerId(url) {
+  // zhihu.com/question/xxx/answer/yyy
+  const match = url.match(/\/question\/\d+\/answer\/(\d+)/);
+  return match ? match[1] : null;
+}
+
+function extractZhihuInitialData(html) {
+  // Zhihu SSR pages embed data in <script id="js-initialData">
+  const match = html.match(/<script\s+id="js-initialData"\s*[^>]*>([\s\S]*?)<\/script>/);
+  if (match) {
+    try {
+      return JSON.parse(match[1]);
+    } catch {}
+  }
+  return null;
+}
+
+function extractZhihuContent(initialData, articleId, answerId) {
+  try {
+    if (articleId && initialData.initialState) {
+      // Article: initialState.entities.articles[id].content
+      const articles = initialData.initialState.entities?.articles;
+      if (articles && articles[articleId]) {
+        const article = articles[articleId];
+        return {
+          title: article.title || "",
+          content: article.content || "",
+          author: article.author?.name || "",
+          created: article.created ? new Date(article.created * 1000).toISOString() : "",
+          voteupCount: article.voteupCount || 0,
+        };
+      }
+    }
+
+    if (answerId && initialData.initialState) {
+      // Answer: initialState.entities.answers[id].content
+      const answers = initialData.initialState.entities?.answers;
+      if (answers && answers[answerId]) {
+        const answer = answers[answerId];
+        const questionTitle = answer.question?.title || "";
+        return {
+          title: questionTitle,
+          content: answer.content || "",
+          author: answer.author?.name || "",
+          created: answer.createdTime ? new Date(answer.createdTime * 1000).toISOString() : "",
+          voteupCount: answer.voteupCount || 0,
+        };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+async function zhihuFetch(url) {
+  const config = await loadConfig();
+  const cookie = config.zhihu?.cookie;
+
+  if (!cookie) {
+    throw new Error(
+      "Zhihu requires cookie authentication. Steps:\n" +
+      "  1. Open zhihu.com in your browser and log in\n" +
+      "  2. Open DevTools (F12) → Network tab → refresh the page\n" +
+      "  3. Click any request → copy the Cookie header value\n" +
+      "  4. Run: aread config set zhihu.cookie \"<paste cookie here>\""
+    );
+  }
+
+  const timeout = parseInt(opts.timeout, 10) * 1000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cookie": cookie,
+        "Referer": "https://www.zhihu.com/",
+      },
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      if (res.status === 403) {
+        throw new Error("cookie expired or invalid. Please update: aread config set zhihu.cookie \"<new cookie>\"");
+      }
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const html = await res.text();
+
+    // Check if we got the JS challenge page instead of real content
+    if (html.includes('id="zh-zse-ck"') && html.length < 1000) {
+      throw new Error(
+        "cookie expired — Zhihu returned challenge page. Please update:\n" +
+        "  aread config set zhihu.cookie \"<new cookie from browser>\""
+      );
+    }
+
+    // Try to extract from initialData (best quality)
+    const articleId = parseZhihuArticleId(url);
+    const answerId = parseZhihuAnswerId(url);
+    const initialData = extractZhihuInitialData(html);
+
+    if (initialData) {
+      const extracted = extractZhihuContent(initialData, articleId, answerId);
+      if (extracted && extracted.content) {
+        info(`${c.green}✓${c.reset} ${c.dim}extracted from zhihu initialData${c.reset}`);
+
+        // Convert HTML content to markdown via turndown
+        let TurndownService;
+        try {
+          TurndownService = (await import("turndown")).default;
+        } catch {
+          throw new Error("turndown not installed. Run: npm i turndown");
+        }
+        const td = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+        const mdContent = td.turndown(extracted.content);
+
+        // Build final markdown with metadata
+        const meta = [];
+        if (extracted.title) meta.push(`# ${extracted.title}`);
+        if (extracted.author) meta.push(`> Author: ${extracted.author}`);
+        if (extracted.created) meta.push(`> Date: ${extracted.created.split("T")[0]}`);
+        if (extracted.voteupCount) meta.push(`> Votes: ${extracted.voteupCount}`);
+
+        return meta.length > 0
+          ? meta.join("\n") + "\n\n" + mdContent
+          : mdContent;
+      }
+    }
+
+    // Fallback: convert full HTML via turndown
+    info(`${c.dim}initialData not found, converting full HTML...${c.reset}`);
+    let TurndownService;
+    try {
+      TurndownService = (await import("turndown")).default;
+    } catch {
+      throw new Error("turndown not installed. Run: npm i turndown");
+    }
+    const td = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+    return td.turndown(html);
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === "AbortError") throw new Error(`zhihu fetch timed out after ${opts.timeout}s`);
+    throw e;
+  }
+}
+
 async function fetchWithFallback(url) {
   // Check cache first
   const cached = await getCachedContent(url);
   if (cached) return { markdown: cached, cached: true };
+
+  // Zhihu: use dedicated fetch with user cookie
+  if (isZhihuUrl(url)) {
+    try {
+      const md = await zhihuFetch(url);
+      await setCachedContent(url, md);
+      return { markdown: md, cached: false };
+    } catch (e) {
+      throw new Error(`zhihu: ${e.message}`);
+    }
+  }
 
   // Warn early about known anti-crawl sites
   const antiCrawl = isAntiCrawlDomain(url);
