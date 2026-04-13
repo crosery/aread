@@ -19,9 +19,9 @@ if (platform() === "win32") {
   }
 }
 
-const VERSION = "1.4.1";
+const VERSION = "1.5.0";
 const JINA_READ = "https://r.jina.ai";
-const SUPPORTED_ENGINES = ["duckduckgo", "bing", "google", "baidu", "auto"];
+const SUPPORTED_ENGINES = ["duckduckgo", "bing", "auto"];
 const DDG_PROBE_TIMEOUT = 3000;
 
 // --- Known anti-crawl domains and HTTP error explanations ---
@@ -133,7 +133,7 @@ ${c.bold}READ OPTIONS${c.reset}
 ${c.bold}SEARCH OPTIONS${c.reset}
     -s, --search <QUERY>       Search the web
     -n, --num <N>              Number of search results (default: 10)
-    -e, --engine <ENGINE>      Search engine: duckduckgo|bing|google|baidu|auto
+    -e, --engine <ENGINE>      Search engine: duckduckgo|bing|auto
                                (default: duckduckgo, auto probes DDG then falls back to Bing)
     -m, --multi                Query all engines concurrently, merge & deduplicate results
     --read                     Also fetch each result as Markdown
@@ -468,277 +468,7 @@ async function bingSearch(query, num) {
   }
 }
 
-// --- Google search ---
 
-function parseGoogleHtml(html, num) {
-  const results = [];
-
-  // Strategy 1: Match <div class="g"> blocks (standard Google layout)
-  const blockRegex = /<div\s+class="[^"]*\bg\b[^"]*"[^>]*>([\s\S]*?)(?=<div\s+class="[^"]*\bg\b[^"]*"|<div\s+id="botstuff")/gi;
-  const blocks = [...html.matchAll(blockRegex)];
-
-  for (const block of blocks) {
-    if (results.length >= num) break;
-    const content = block[1];
-
-    // Title is in <h3> inside an <a> with href
-    const titleLinkMatch = content.match(/<a[^>]+href="(https?:\/\/(?!www\.google\.com)[^"]*)"[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/i)
-      || content.match(/<h3[^>]*>([\s\S]*?)<\/h3>[\s\S]*?<a[^>]+href="(https?:\/\/(?!www\.google\.com)[^"]*)"[^>]*>/i);
-    if (!titleLinkMatch) continue;
-
-    // Handle both match orderings (url first or title first)
-    let url, title;
-    if (titleLinkMatch[1].startsWith("http")) {
-      url = titleLinkMatch[1];
-      title = titleLinkMatch[2].replace(/<[^>]*>/g, "").trim();
-    } else {
-      title = titleLinkMatch[1].replace(/<[^>]*>/g, "").trim();
-      url = titleLinkMatch[2];
-    }
-
-    // Extract snippet from data-sncf, VwiC3b class, or long <span>
-    let abstract = "";
-    const snippetMatch = content.match(/<div[^>]*(?:data-sncf|class="[^"]*VwiC3b[^"]*")[^>]*>([\s\S]*?)<\/div>/i)
-      || content.match(/<span[^>]*class="[^"]*(?:st|VwiC3b|hgKElc)[^"]*"[^>]*>([\s\S]*?)<\/span>/i)
-      || content.match(/<div[^>]*class="[^"]*IsZvec[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-    if (snippetMatch) {
-      abstract = (snippetMatch[1] || "").replace(/<[^>]*>/g, "").trim();
-    }
-
-    if (url && title) results.push({ title, url, abstract });
-  }
-
-  // Strategy 2: Fallback — scan for <a href> + <h3> pairs anywhere in the HTML
-  if (results.length === 0) {
-    const linkRegex = /<a[^>]+href="(https?:\/\/(?!www\.google\.com|maps\.google|accounts\.google|support\.google|policies\.google)[^"]*)"[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/gi;
-    const links = [...html.matchAll(linkRegex)];
-    for (const m of links) {
-      if (results.length >= num) break;
-      const url = m[1];
-      const title = m[2].replace(/<[^>]*>/g, "").trim();
-      if (url && title) results.push({ title, url, abstract: "" });
-    }
-  }
-
-  return results;
-}
-
-async function googleSearch(query, num) {
-  const timeout = parseInt(opts.timeout, 10) * 1000;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const params = new URLSearchParams({ q: query, num: String(num), hl: "en" });
-    const res = await fetch(`https://www.google.com/search?${params}`, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-      signal: controller.signal,
-      redirect: "follow",
-    });
-    clearTimeout(timer);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const html = await res.text();
-    return parseGoogleHtml(html, num);
-  } catch (e) {
-    clearTimeout(timer);
-    if (e.name === "AbortError") throw new Error(`google search timed out after ${opts.timeout}s`);
-    throw new Error(`google search failed: ${e.message}`);
-  }
-}
-
-// --- Baidu search ---
-
-function extractBaiduAbstract(block) {
-  // Strategy 1: Extract from <!--s-data:{"summaryData":...}--> JSON comments (modern Baidu SSR)
-  const sdataMatch = block.match(/<!--s-data:(\{"summaryData"[\s\S]*?)-->/);
-  if (sdataMatch) {
-    try {
-      const data = JSON.parse(sdataMatch[1]);
-      const lines = data.summaryData?.generalLines || [];
-      const texts = lines.flatMap((l) => (l.data || []).map((d) => d.text)).filter(Boolean);
-      if (texts.length > 0) {
-        return texts
-          .join(" ")
-          .replace(/<[^>]*>/g, "")
-          .replace(/\s+/g, " ")
-          .trim();
-      }
-    } catch {}
-  }
-
-  // Strategy 2: Rendered summary-text span (data-module="abstract" section)
-  const summaryMatch = block.match(/<span[^>]+class="[^"]*summary-text[^"]*"[^>]*>([\s\S]*?)<\/span>/i);
-  if (summaryMatch) {
-    const text = summaryMatch[1].replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
-    if (text.length > 5) return text;
-  }
-
-  // Strategy 3: data-module="abstract" div content
-  const moduleMatch = block.match(/data-module="abstract"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/i);
-  if (moduleMatch) {
-    const text = moduleMatch[1].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").replace(/\s+/g, " ").trim();
-    if (text.length > 5) return text;
-  }
-
-  // Strategy 4: Classic c-abstract class
-  const classicMatch = block.match(/<(?:div|span)[^>]+class="[^"]*c-abstract[^"]*"[^>]*>([\s\S]*?)<\/(?:div|span)>/i);
-  if (classicMatch) {
-    const text = classicMatch[1].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").replace(/\s+/g, " ").trim();
-    if (text.length > 5) return text;
-  }
-
-  // Strategy 5: content-right class
-  const crMatch = block.match(/<(?:span|div|p)[^>]+class="[^"]*content-right[^"]*"[^>]*>([\s\S]*?)<\/(?:span|div|p)>/i);
-  if (crMatch) {
-    const text = crMatch[1].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").replace(/\s+/g, " ").trim();
-    if (text.length > 5) return text;
-  }
-
-  return "";
-}
-
-function parseBaiduHtml(html, num) {
-  const results = [];
-
-  // Split into result blocks: Baidu wraps each result in <div class="result c-container ...">
-  const resultBlockRegex = /<div[^>]+class="[^"]*result\s+c-container[^"]*"[^>]*>([\s\S]*?)(?=<div[^>]+class="[^"]*result\s+c-container[^"]*"|<div\s+id="(?:page|rs|content_right|con-ar)")/gi;
-  const resultBlocks = [...html.matchAll(resultBlockRegex)];
-
-  for (const blockMatch of resultBlocks) {
-    if (results.length >= num) break;
-    const block = blockMatch[1];
-
-    // Extract title + URL: try h3.t > a, then h3 > a with cosc-title, then a.c-title
-    const titleMatch = block.match(/<h3[^>]*class="[^"]*\bt\b[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i)
-      || block.match(/<h3[^>]*>\s*<a[^>]+class="[^"]*cosc-title[^"]*"[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i)
-      || block.match(/<a[^>]+class="[^"]*c-title[^"]*"[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
-    if (!titleMatch) continue;
-
-    const url = titleMatch[1].replace(/&amp;/g, "&");
-    const title = titleMatch[2]
-      .replace(/<[^>]*>/g, "")
-      .replace(/<!--[\s\S]*?-->/g, "")
-      .replace(/&[^;]+;/g, "")
-      .trim();
-
-    if (!url || !title || url.startsWith("javascript:")) continue;
-
-    const abstract = extractBaiduAbstract(block);
-    results.push({ title, url, abstract });
-  }
-
-  // Fallback: old h3-based parsing if block-based approach yielded nothing
-  if (results.length === 0) {
-    const h3Regex = /<h3[^>]*class="[^"]*\bt\b[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-    const h3Blocks = [...html.matchAll(h3Regex)];
-    for (const block of h3Blocks) {
-      if (results.length >= num) break;
-      const url = block[1];
-      const title = block[2].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").replace(/&[^;]+;/g, "").trim();
-      if (!url || !title || url.startsWith("javascript:")) continue;
-      results.push({ title, url, abstract: "" });
-    }
-  }
-
-  // Fallback: try c-title links (newer Baidu layout)
-  if (results.length === 0) {
-    const altRegex = /<a[^>]+class="[^"]*c-title[^"]*"[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-    const altBlocks = [...html.matchAll(altRegex)];
-    for (const block of altBlocks) {
-      if (results.length >= num) break;
-      const url = block[1];
-      const title = block[2].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").trim();
-      if (!url || !title || url.startsWith("javascript:")) continue;
-      results.push({ title, url, abstract: "" });
-    }
-  }
-
-  return results;
-}
-
-// Resolve Baidu redirect URLs (baidu.com/link?url=...) to real target URLs
-async function resolveBaiduUrls(results) {
-  const resolved = await Promise.all(
-    results.map(async (r) => {
-      if (!r.url.includes("baidu.com/link?")) return r;
-      try {
-        const res = await fetch(r.url, {
-          method: "HEAD",
-          redirect: "follow",
-          headers: { "User-Agent": "Mozilla/5.0 (compatible; aread/1.0)" },
-          signal: AbortSignal.timeout(5000),
-        });
-        const realUrl = res.url;
-        if (realUrl && !realUrl.includes("baidu.com/link?")) {
-          return { ...r, url: realUrl };
-        }
-      } catch {
-        // Keep original URL on failure
-      }
-      return r;
-    })
-  );
-  return resolved;
-}
-
-async function baiduSearch(query, num) {
-  const timeout = parseInt(opts.timeout, 10) * 1000;
-  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-  // Baidu requires cookies to avoid security verification page.
-  // First visit baidu.com homepage to obtain session cookies.
-  let cookieStr = "";
-  try {
-    const homeRes = await fetch("https://www.baidu.com/", {
-      headers: { "User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
-      redirect: "follow",
-    });
-    const setCookies = homeRes.headers.getSetCookie?.() || [];
-    cookieStr = setCookies.map((c) => c.split(";")[0]).join("; ");
-  } catch {
-    // Continue without cookies — may still work in some regions
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const params = new URLSearchParams({ wd: query, rn: String(num) });
-    const headers = {
-      "User-Agent": UA,
-      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Referer": "https://www.baidu.com/",
-    };
-    if (cookieStr) headers["Cookie"] = cookieStr;
-
-    const res = await fetch(`https://www.baidu.com/s?${params}`, {
-      headers,
-      signal: controller.signal,
-      redirect: "follow",
-    });
-    clearTimeout(timer);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const html = await res.text();
-
-    // Detect security verification page
-    if (html.includes("百度安全验证") && html.length < 5000) {
-      throw new Error("baidu returned security verification page (try again later)");
-    }
-
-    const results = parseBaiduHtml(html, num);
-    return resolveBaiduUrls(results);
-  } catch (e) {
-    clearTimeout(timer);
-    if (e.name === "AbortError") throw new Error(`baidu search timed out after ${opts.timeout}s`);
-    throw new Error(`baidu search failed: ${e.message}`);
-  }
-}
 
 // --- Auto engine detection ---
 
@@ -776,10 +506,8 @@ async function resolveEngine(engine) {
 // Search with automatic fallback: if the chosen engine fails, try alternatives
 async function searchWithFallback(engine, query, num) {
   const fallbackOrder = {
-    duckduckgo: ["bing", "baidu"],
-    bing: ["baidu"],
-    google: ["bing", "baidu"],
-    baidu: ["bing"],
+    duckduckgo: ["bing"],
+    bing: ["duckduckgo"],
   };
 
   try {
@@ -803,7 +531,7 @@ async function searchWithFallback(engine, query, num) {
 
 // --- Multi-engine aggregate search ---
 
-const MULTI_ENGINES = ["bing", "google", "baidu", "duckduckgo"];
+const MULTI_ENGINES = ["bing", "duckduckgo"];
 
 async function multiEngineSearch(query, num) {
   info(`${c.dim}multi-engine search: querying ${MULTI_ENGINES.join(", ")}...${c.reset}`);
@@ -850,8 +578,6 @@ async function searchWith(engine, query, num) {
   switch (engine) {
     case "duckduckgo": return ddgSearch(query, num);
     case "bing": return bingSearch(query, num);
-    case "google": return googleSearch(query, num);
-    case "baidu": return baiduSearch(query, num);
     default: die(`unknown engine: ${engine} (supported: ${SUPPORTED_ENGINES.join(", ")})`);
   }
 }

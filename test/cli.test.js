@@ -296,8 +296,6 @@ describe("multi-engine support", () => {
     assert.ok(stdout.includes("--engine"));
     assert.ok(stdout.includes("duckduckgo"));
     assert.ok(stdout.includes("bing"));
-    assert.ok(stdout.includes("google"));
-    assert.ok(stdout.includes("baidu"));
     assert.ok(stdout.includes("auto"));
   });
 
@@ -386,124 +384,6 @@ describe("Bing search HTML parsing", () => {
   });
 });
 
-describe("Google search HTML parsing", () => {
-  it("parseGoogleHtml extracts results from mock HTML (Strategy 1: div.g blocks)", () => {
-    const html = `
-      <div class="g"><a href="https://example.com/google1"><h3>Google Result 1</h3></a>
-      <div class="VwiC3b">Google snippet 1 that is long enough</div></div>
-      <div class="g"><a href="https://example.com/google2"><h3>Google Result 2</h3></a>
-      <div class="VwiC3b">Google snippet 2 that is also long</div></div>
-      <div id="botstuff"></div>
-    `;
-
-    // Strategy 1: div.g blocks
-    const blockRegex = /<div\s+class="[^"]*\bg\b[^"]*"[^>]*>([\s\S]*?)(?=<div\s+class="[^"]*\bg\b[^"]*"|<div\s+id="botstuff")/gi;
-    const blocks = [...html.matchAll(blockRegex)];
-    assert.ok(blocks.length >= 1);
-
-    // Verify link + h3 extraction
-    const content = blocks[0][1];
-    const titleLinkMatch = content.match(/<a[^>]+href="(https?:\/\/(?!www\.google\.com)[^"]*)"[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/i);
-    assert.ok(titleLinkMatch);
-    assert.equal(titleLinkMatch[1], "https://example.com/google1");
-    assert.equal(titleLinkMatch[2].replace(/<[^>]*>/g, "").trim(), "Google Result 1");
-  });
-
-  it("parseGoogleHtml uses fallback strategy for non-standard layouts", () => {
-    // Fallback: scan for <a href>...<h3> pairs
-    const html = `
-      <div class="some-wrapper"><a href="https://example.com/result1" class="whatever"><h3 class="LC20lb">Fallback Result 1</h3></a></div>
-      <div class="some-wrapper"><a href="https://example.com/result2" class="whatever"><h3 class="LC20lb">Fallback Result 2</h3></a></div>
-    `;
-
-    const linkRegex = /<a[^>]+href="(https?:\/\/(?!www\.google\.com|maps\.google|accounts\.google|support\.google|policies\.google)[^"]*)"[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/gi;
-    const links = [...html.matchAll(linkRegex)];
-    assert.ok(links.length >= 2);
-    assert.equal(links[0][1], "https://example.com/result1");
-    assert.equal(links[0][2].replace(/<[^>]*>/g, "").trim(), "Fallback Result 1");
-  });
-
-  it("parseGoogleHtml excludes google.com URLs", () => {
-    const html = `
-      <div class="g"><a href="https://www.google.com/search?q=test"><h3>Google Internal</h3></a></div>
-      <div class="g"><a href="https://example.com/real"><h3>Real Result</h3></a></div>
-      <div id="botstuff"></div>
-    `;
-
-    // The google.com URL should be excluded
-    const blockRegex = /<div\s+class="[^"]*\bg\b[^"]*"[^>]*>([\s\S]*?)(?=<div\s+class="[^"]*\bg\b[^"]*"|<div\s+id="botstuff")/gi;
-    const blocks = [...html.matchAll(blockRegex)];
-    const results = [];
-    for (const block of blocks) {
-      const m = block[1].match(/<a[^>]+href="(https?:\/\/(?!www\.google\.com)[^"]*)"[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/i);
-      if (m) results.push(m[1]);
-    }
-    assert.equal(results.length, 1);
-    assert.equal(results[0], "https://example.com/real");
-  });
-});
-
-describe("Baidu search HTML parsing", () => {
-  it("parseBaiduHtml extracts results from mock HTML", () => {
-    const html = `
-      <h3 class="t"><a href="https://www.baidu.com/link?url=abc123" target="_blank">Baidu Result 1</a></h3>
-      <h3 class="t"><a href="https://www.baidu.com/link?url=def456" target="_blank">Baidu Result 2</a></h3>
-    `;
-
-    const regex = /<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-    const blocks = [...html.matchAll(regex)];
-    assert.equal(blocks.length, 2);
-
-    assert.ok(blocks[0][1].includes("baidu.com/link"));
-    assert.equal(blocks[0][2].replace(/<[^>]*>/g, "").trim(), "Baidu Result 1");
-    assert.equal(blocks[1][2].replace(/<[^>]*>/g, "").trim(), "Baidu Result 2");
-  });
-
-  it("parseBaiduHtml filters out javascript: URLs", () => {
-    const html = `
-      <h3 class="t"><a href="https://www.baidu.com/link?url=abc" target="_blank">Real Result</a></h3>
-      <h3 class="t"><a href="javascript:void(0);" target="_blank">Fake Download</a></h3>
-      <h3 class="t"><a href="https://www.baidu.com/link?url=def" target="_blank">Another Result</a></h3>
-    `;
-
-    const regex = /<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-    const blocks = [...html.matchAll(regex)];
-    const results = [];
-    for (const block of blocks) {
-      const url = block[1];
-      const title = block[2].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").trim();
-      if (!url || !title || url.startsWith("javascript:")) continue;
-      results.push({ title, url });
-    }
-    assert.equal(results.length, 2);
-    assert.equal(results[0].title, "Real Result");
-    assert.equal(results[1].title, "Another Result");
-  });
-
-  it("parseBaiduHtml handles new Baidu layout with extra classes", () => {
-    const html = `
-      <h3 class="t _sc-title_10ku5_63 title_2X7ZC" style=" "><a class="sc-link" href="http://www.baidu.com/link?url=xyz" target="_blank" data-module="title"><div><div><p class="sc-paragraph"><span><span><!--s-text-->哔哩哔哩-<em>bilibili</em><!--/s-text--></span></span></p></div></div></a></h3>
-    `;
-
-    const regex = /<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-    const blocks = [...html.matchAll(regex)];
-    assert.equal(blocks.length, 1);
-    assert.ok(blocks[0][1].includes("baidu.com/link"));
-
-    const title = blocks[0][2].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").trim();
-    assert.ok(title.includes("哔哩哔哩"));
-  });
-
-  it("detects Baidu security verification page", () => {
-    const securityHtml = `<!DOCTYPE html><html><head><title>百度安全验证</title></head><body><div class="timeout">网络不给力</div></body></html>`;
-    const isSecurity = securityHtml.includes("百度安全验证") && securityHtml.length < 5000;
-    assert.ok(isSecurity);
-
-    const normalHtml = `<!DOCTYPE html><html><head><title>bilibili_百度搜索</title></head><body>${"x".repeat(10000)}</body></html>`;
-    const isNormal = normalHtml.includes("百度安全验证") && normalHtml.length < 5000;
-    assert.ok(!isNormal);
-  });
-});
 
 describe("auto engine detection and fallback", () => {
   it("--engine auto is accepted without error on --help", async () => {
@@ -547,13 +427,6 @@ describe("auto engine detection and fallback", () => {
     assert.ok(bingFnMatch[0].includes("mkt"), "bingSearch should include mkt parameter");
   });
 
-  it("baidu search fetches cookies before searching", async () => {
-    const src = await readFile(CLI, "utf-8");
-    const baiduFnMatch = src.match(/async function baiduSearch[\s\S]*?^}/m);
-    assert.ok(baiduFnMatch, "baiduSearch function should exist");
-    assert.ok(baiduFnMatch[0].includes("getSetCookie"), "baiduSearch should handle cookies");
-    assert.ok(baiduFnMatch[0].includes("百度安全验证"), "baiduSearch should detect security page");
-  });
 });
 
 // --- 7. Multi-engine aggregate search (--multi) ---
