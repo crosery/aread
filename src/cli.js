@@ -111,11 +111,16 @@ function urlHash(url) {
   return createHash("sha256").update(url).digest("hex");
 }
 
+const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
 async function getCachedContent(url) {
   if (opts && opts["no-cache"]) return null;
   const cacheDir = getCacheDir();
   const cachePath = join(cacheDir, urlHash(url) + ".md");
   try {
+    const { stat } = await import("node:fs/promises");
+    const st = await stat(cachePath);
+    if (Date.now() - st.mtimeMs > CACHE_MAX_AGE_MS) return null; // expired
     return await readFile(cachePath, "utf-8");
   } catch {
     return null;
@@ -123,6 +128,8 @@ async function getCachedContent(url) {
 }
 
 async function setCachedContent(url, content) {
+  // Don't cache garbage (too short or looks like JS/CSS noise)
+  if (!content || content.length < 50) return;
   const cacheDir = getCacheDir();
   await mkdir(cacheDir, { recursive: true });
   const cachePath = join(cacheDir, urlHash(url) + ".md");
@@ -744,9 +751,14 @@ function deriveKey(password, iterations) {
   return createHash("sha1"); // placeholder — use proper pbkdf2
 }
 
+// Cache extracted cookies to avoid repeated Keychain/DB access
+const _cookieCache = new Map();
+
 async function extractBrowserCookies(domain) {
+  if (_cookieCache.has(domain)) return _cookieCache.get(domain);
+
   const found = findChromeDbPath();
-  if (!found) return null;
+  if (!found) { _cookieCache.set(domain, null); return null; }
 
   const { dbPath, browser } = found;
   info(`${c.dim}reading cookies from ${browser.name}...${c.reset}`);
@@ -820,9 +832,11 @@ async function extractBrowserCookies(domain) {
       }
     }
 
-    if (cookieParts.length === 0) return null;
+    if (cookieParts.length === 0) { _cookieCache.set(domain, null); return null; }
+    const cookieStr = cookieParts.join("; ");
     info(`${c.green}✓${c.reset} ${c.dim}extracted ${cookieParts.length} cookies from ${browser.name}${c.reset}`);
-    return cookieParts.join("; ");
+    _cookieCache.set(domain, cookieStr);
+    return cookieStr;
   } finally {
     try { unlinkSync(tmpDb); } catch {}
     try { unlinkSync(tmpDb + "-wal"); } catch {}
