@@ -861,6 +861,12 @@ function parseZhihuArticleId(url) {
   return match ? match[1] : null;
 }
 
+function parseZhihuQuestionId(url) {
+  // zhihu.com/question/xxx (with or without /answer/yyy)
+  const match = url.match(/\/question\/(\d+)/);
+  return match ? match[1] : null;
+}
+
 function parseZhihuAnswerId(url) {
   // zhihu.com/question/xxx/answer/yyy
   const match = url.match(/\/question\/\d+\/answer\/(\d+)/);
@@ -878,16 +884,18 @@ function extractZhihuInitialData(html) {
   return null;
 }
 
-function extractZhihuContent(initialData, articleId, answerId) {
+function extractZhihuContent(initialData, articleId, questionId, answerId) {
   try {
-    if (articleId && initialData.initialState) {
-      // Article: initialState.entities.articles[id].content
-      const articles = initialData.initialState.entities?.articles;
-      if (articles && articles[articleId]) {
-        const article = articles[articleId];
+    const entities = initialData.initialState?.entities;
+    if (!entities) return null;
+
+    // Case 1: Article (zhuanlan.zhihu.com/p/xxx)
+    if (articleId) {
+      const article = entities.articles?.[articleId];
+      if (article && article.content) {
         return {
           title: article.title || "",
-          content: article.content || "",
+          content: article.content,
           author: article.author?.name || "",
           created: article.created ? new Date(article.created * 1000).toISOString() : "",
           voteupCount: article.voteupCount || 0,
@@ -895,18 +903,48 @@ function extractZhihuContent(initialData, articleId, answerId) {
       }
     }
 
-    if (answerId && initialData.initialState) {
-      // Answer: initialState.entities.answers[id].content
-      const answers = initialData.initialState.entities?.answers;
-      if (answers && answers[answerId]) {
-        const answer = answers[answerId];
-        const questionTitle = answer.question?.title || "";
+    // Case 2: Specific answer (/question/xxx/answer/yyy)
+    if (answerId) {
+      const answer = entities.answers?.[answerId];
+      if (answer && answer.content) {
+        const questionTitle = entities.questions?.[questionId]?.title || answer.question?.title || "";
         return {
           title: questionTitle,
-          content: answer.content || "",
+          content: answer.content,
           author: answer.author?.name || "",
           created: answer.createdTime ? new Date(answer.createdTime * 1000).toISOString() : "",
           voteupCount: answer.voteupCount || 0,
+        };
+      }
+    }
+
+    // Case 3: Question page (/question/xxx) — extract question + all answers
+    if (questionId) {
+      const question = entities.questions?.[questionId];
+      const answers = entities.answers || {};
+      const answerList = Object.values(answers).filter(a => a.content && a.content.length > 0);
+
+      if (question && answerList.length > 0) {
+        // Sort by votes descending
+        answerList.sort((a, b) => (b.voteupCount || 0) - (a.voteupCount || 0));
+
+        // Build combined HTML: question detail + all answers
+        const parts = [];
+        if (question.detail) parts.push(question.detail);
+        for (const a of answerList) {
+          parts.push(
+            `<h2>${a.author?.name || "Anonymous"} (${a.voteupCount || 0} votes)</h2>` +
+            a.content
+          );
+        }
+
+        return {
+          title: question.title || "",
+          content: parts.join("<hr>"),
+          author: "",
+          created: "",
+          voteupCount: 0,
+          answerCount: answerList.length,
         };
       }
     }
@@ -968,13 +1006,17 @@ async function zhihuFetch(url) {
 
     // Try to extract from initialData (best quality)
     const articleId = parseZhihuArticleId(url);
+    const questionId = parseZhihuQuestionId(url);
     const answerId = parseZhihuAnswerId(url);
     const initialData = extractZhihuInitialData(html);
 
     if (initialData) {
-      const extracted = extractZhihuContent(initialData, articleId, answerId);
+      const extracted = extractZhihuContent(initialData, articleId, questionId, answerId);
       if (extracted && extracted.content) {
-        info(`${c.green}✓${c.reset} ${c.dim}extracted from zhihu initialData${c.reset}`);
+        const label = extracted.answerCount
+          ? `${extracted.answerCount} answers`
+          : "content";
+        info(`${c.green}✓${c.reset} ${c.dim}extracted ${label} from zhihu initialData${c.reset}`);
 
         // Convert HTML content to markdown via turndown
         let TurndownService;
@@ -999,13 +1041,9 @@ async function zhihuFetch(url) {
       }
     }
 
-    // No extractable content — zhihu answer/question pages are CSR (content loaded by JS)
-    const pageType = answerId ? "answer" : articleId ? "article" : "page";
+    // No extractable content
     throw new Error(
-      `could not extract content from this zhihu ${pageType}. ` +
-      (answerId
-        ? "Zhihu answer pages are client-side rendered and cannot be fetched without a headless browser."
-        : "The page may require JavaScript rendering to display content.")
+      "could not extract content from this zhihu page. The page may have no answers yet or require JavaScript rendering."
     );
   } catch (e) {
     clearTimeout(timer);
