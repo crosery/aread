@@ -1,7 +1,7 @@
 {
   "name": "aread-cli",
-  "version": "1.5.0",
-  "description": "AI-friendly web reader & search. Read any URL as Markdown, search with DuckDuckGo.",
+  "version": "1.7.0",
+  "description": "AI-friendly web reader & search with AI summarization. Read any URL as Markdown, search with DuckDuckGo/Bing, AI-powered content summarization.",
   "bin": {
     "aread": "src/cli.js"
   },
@@ -22,7 +22,10 @@
     "scraper",
     "cli",
     "llm",
-    "web"
+    "web",
+    "summarize",
+    "openai",
+    "zhihu"
   ],
   "license": "MIT",
   "repository": {

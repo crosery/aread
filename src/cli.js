@@ -21,7 +21,7 @@ if (platform() === "win32") {
   }
 }
 
-const VERSION = "1.6.0";
+const VERSION = "1.7.0";
 const JINA_READ = "https://r.jina.ai";
 const SUPPORTED_ENGINES = ["duckduckgo", "bing", "auto"];
 const DDG_PROBE_TIMEOUT = 3000;
@@ -111,11 +111,16 @@ function urlHash(url) {
   return createHash("sha256").update(url).digest("hex");
 }
 
+const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
 async function getCachedContent(url) {
   if (opts && opts["no-cache"]) return null;
   const cacheDir = getCacheDir();
   const cachePath = join(cacheDir, urlHash(url) + ".md");
   try {
+    const { stat } = await import("node:fs/promises");
+    const st = await stat(cachePath);
+    if (Date.now() - st.mtimeMs > CACHE_MAX_AGE_MS) return null; // expired
     return await readFile(cachePath, "utf-8");
   } catch {
     return null;
@@ -123,6 +128,8 @@ async function getCachedContent(url) {
 }
 
 async function setCachedContent(url, content) {
+  // Don't cache garbage (too short or looks like JS/CSS noise)
+  if (!content || content.length < 50) return;
   const cacheDir = getCacheDir();
   await mkdir(cacheDir, { recursive: true });
   const cachePath = join(cacheDir, urlHash(url) + ".md");
@@ -239,20 +246,27 @@ async function aiSummarize(markdown, url) {
         messages: [
           {
             role: "system",
-            content: `Extract key information from the web page. Respond in markdown, same language as source. Keep it under 500 words.
+            content: `你是一个内容精炼器。保留原文 90% 的信息量，只删掉废话、重复、套话和格式噪音。
 
-Format:
-# (subject-specific title, not "summary")
+输出要求：
+- 用原文语言，markdown 格式
+- 以 # 标题 开头（反映主题，不写"总结"）
+- 所有数字、百分比、金额、日期、人名、产品名、技术术语必须原样保留
+- 代码片段、API 地址、命令行示例必须保留
+- 多个观点/回答用 ## 子标题分隔，标注作者和赞数
+- 用 bullet points 组织信息，但每条可以长一些，确保完整
 
-(1-2 sentence core conclusion)
+只删掉这些：
+- "众所周知""不难发现""值得注意的是"等套话
+- 重复表达同一个意思的句子
+- 导航栏、侧边栏、广告、页脚等非正文内容
+- "点赞""收藏""关注"等交互提示
 
-- key fact or data point
-- key fact or data point
-- ...
-
-(Only add short paragraphs if there are technical details or nuanced arguments that bullet points can't capture. Otherwise stop after the bullets.)
-
-Rules: only verifiable facts from the source. No filler, no "this article discusses", no meta-commentary. Prioritize facts and data over opinions. Ignore nav, ads, boilerplate.`,
+不要删掉这些：
+- 论据、论证过程、因果关系
+- 对比数据、价格、性能指标
+- 引用的来源和链接
+- 作者的核心判断和结论`,
           },
           {
             role: "user",
@@ -431,9 +445,11 @@ async function handleConfigCommand(args) {
     const config = await loadConfig();
     setNestedValue(config, key, value);
     await saveConfig(config);
-    // Mask apiKey in output
-    const display = key.toLowerCase().includes("apikey") || key.toLowerCase().includes("key")
-      ? value.slice(0, 6) + "..." + value.slice(-4)
+    // Mask sensitive values in output
+    const keyLower = key.toLowerCase();
+    const isSensitive = keyLower.includes("apikey") || keyLower.includes("key") || keyLower.includes("cookie");
+    const display = isSensitive
+      ? value.slice(0, 10) + "..." + ` (${value.length} chars)`
       : value;
     process.stderr.write(`${c.green}✓${c.reset} ${key} = ${display}\n`);
     return;
@@ -469,6 +485,10 @@ async function handleConfigCommand(args) {
         const k = display.ai.apiKey;
         display.ai.apiKey = k.slice(0, 6) + "..." + k.slice(-4);
       }
+      if (display.zhihu && display.zhihu.cookie) {
+        const ck = display.zhihu.cookie;
+        display.zhihu.cookie = ck.slice(0, 20) + "..." + ` (${ck.length} chars)`;
+      }
       console.log(JSON.stringify(display, null, 2));
     }
     process.stderr.write(`\n${c.dim}config: ${getConfigPath()}${c.reset}\n`);
@@ -502,6 +522,7 @@ ${c.bold}AI CONFIG KEYS${c.reset}
     ai.apiKey          API key
     ai.model           Model name (e.g. gpt-4o-mini, deepseek-chat, etc.)
     ai.autoSummarize   Auto-summarize on every fetch (true/false)
+    zhihu.cookie       Zhihu browser cookie (for fetching zhihu.com articles)
 
 ${c.bold}EXAMPLES${c.reset}
     aread config set ai.provider openrouter
@@ -530,7 +551,7 @@ ${c.bold}READ OPTIONS${c.reset}
     --no-summarize             Disable AI summary (override autoSummarize)
 
 ${c.bold}SEARCH OPTIONS${c.reset}
-    -s, --search <QUERY>       Search the web
+    -s, --search <QUERY>       Search the web (use quotes for multi-word: -s "query here")
     -n, --num <N>              Number of search results (default: 10)
     -e, --engine <ENGINE>      Search engine: duckduckgo|bing|auto
                                (default: duckduckgo, auto probes DDG then falls back to Bing)
@@ -697,10 +718,362 @@ async function localFetch(url) {
   return td.turndown(html);
 }
 
+// --- Browser cookie extraction (Chrome/Chromium on macOS) ---
+
+const CHROME_BROWSERS = [
+  { name: "Chrome",   dir: "Google/Chrome/",                  keychain: "Chrome Safe Storage" },
+  { name: "Arc",      dir: "Arc/User Data/",                  keychain: "Arc Safe Storage" },
+  { name: "Edge",     dir: "Microsoft Edge/",                 keychain: "Microsoft Edge Safe Storage" },
+  { name: "Brave",    dir: "BraveSoftware/Brave-Browser/",    keychain: "Brave Safe Storage" },
+  { name: "Chromium", dir: "chromium/",                       keychain: "Chromium Safe Storage" },
+];
+
+function findChromeDbPath() {
+  if (platform() !== "darwin") return null; // macOS only for now
+  const base = join(homedir(), "Library", "Application Support");
+  for (const b of CHROME_BROWSERS) {
+    const dbPath = join(base, b.dir, "Default", "Cookies");
+    if (existsSync(dbPath)) return { dbPath, browser: b };
+  }
+  return null;
+}
+
+async function getKeychainPassword(service) {
+  return new Promise((resolve, reject) => {
+    const proc = spawnSync("security", ["find-generic-password", "-s", service, "-w"], {
+      timeout: 10000,
+      encoding: "utf-8",
+    });
+    if (proc.status !== 0) {
+      const err = (proc.stderr || "").trim();
+      if (err.includes("not be found")) reject(new Error(`No Keychain entry for "${service}"`));
+      else reject(new Error(`Keychain error: ${err}`));
+      return;
+    }
+    resolve(proc.stdout.trim());
+  });
+}
+
+function deriveKey(password, iterations) {
+  return createHash("sha1"); // placeholder — use proper pbkdf2
+}
+
+// Cache extracted cookies to avoid repeated Keychain/DB access
+const _cookieCache = new Map();
+
+async function extractBrowserCookies(domain) {
+  if (_cookieCache.has(domain)) return _cookieCache.get(domain);
+
+  const found = findChromeDbPath();
+  if (!found) { _cookieCache.set(domain, null); return null; }
+
+  const { dbPath, browser } = found;
+  info(`${c.dim}reading cookies from ${browser.name}...${c.reset}`);
+
+  // Get Keychain password and derive AES key
+  let keychainPassword;
+  try {
+    keychainPassword = await getKeychainPassword(browser.keychain);
+  } catch (e) {
+    info(`${c.dim}keychain access failed: ${e.message}${c.reset}`);
+    return null;
+  }
+
+  const { pbkdf2Sync, createDecipheriv } = await import("node:crypto");
+  const aesKey = pbkdf2Sync(keychainPassword, "saltysalt", 1003, 16, "sha1");
+
+  // Copy DB to avoid locking issues (Chrome may have it open)
+  const tmpDb = join("/tmp", `aread-cookies-${Date.now()}.db`);
+  const { copyFileSync, unlinkSync } = await import("node:fs");
+  try {
+    copyFileSync(dbPath, tmpDb);
+    if (existsSync(dbPath + "-wal")) copyFileSync(dbPath + "-wal", tmpDb + "-wal");
+    if (existsSync(dbPath + "-shm")) copyFileSync(dbPath + "-shm", tmpDb + "-shm");
+  } catch {
+    return null;
+  }
+
+  try {
+    // Query with sqlite3 CLI (zero dependency)
+    const domains = [domain, "." + domain];
+    // Include subdomains
+    const domainClauses = domains.map(d => `host_key = '${d.replace(/'/g, "''")}'`).join(" OR ");
+    const sql = `SELECT host_key, name, value, hex(encrypted_value) as ev_hex, path, expires_utc, is_secure, is_httponly FROM cookies WHERE (${domainClauses} OR host_key LIKE '%.${domain.replace(/'/g, "''")}') AND (has_expires = 0 OR expires_utc > ${Date.now() * 1000 + 11644473600000000});`;
+
+    const result = spawnSync("sqlite3", ["-json", tmpDb, sql], {
+      timeout: 5000,
+      encoding: "utf-8",
+    });
+
+    if (result.status !== 0) return null;
+    const rows = JSON.parse(result.stdout || "[]");
+    if (rows.length === 0) return null;
+
+    // Decrypt cookies and build cookie string
+    const cookieParts = [];
+    for (const row of rows) {
+      let value = row.value || "";
+
+      if (!value && row.ev_hex) {
+        try {
+          const ev = Buffer.from(row.ev_hex, "hex");
+          if (ev.length > 3) {
+            const prefix = ev.slice(0, 3).toString("utf-8");
+            if (prefix === "v10") {
+              const ciphertext = ev.slice(3);
+              const iv = Buffer.alloc(16, 0x20);
+              const decipher = createDecipheriv("aes-128-cbc", aesKey, iv);
+              const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+              if (plaintext.length > 32) {
+                value = plaintext.slice(32).toString("utf-8");
+              }
+            }
+          }
+        } catch {
+          continue; // skip failed decryption
+        }
+      }
+
+      if (value) {
+        cookieParts.push(`${row.name}=${value}`);
+      }
+    }
+
+    if (cookieParts.length === 0) { _cookieCache.set(domain, null); return null; }
+    const cookieStr = cookieParts.join("; ");
+    info(`${c.green}✓${c.reset} ${c.dim}extracted ${cookieParts.length} cookies from ${browser.name}${c.reset}`);
+    _cookieCache.set(domain, cookieStr);
+    return cookieStr;
+  } finally {
+    try { unlinkSync(tmpDb); } catch {}
+    try { unlinkSync(tmpDb + "-wal"); } catch {}
+    try { unlinkSync(tmpDb + "-shm"); } catch {}
+  }
+}
+
+// --- Zhihu-specific fetch ---
+
+function isZhihuUrl(url) {
+  try {
+    const host = new URL(url).hostname;
+    return host === "zhihu.com" || host.endsWith(".zhihu.com");
+  } catch {
+    return false;
+  }
+}
+
+function parseZhihuArticleId(url) {
+  // zhuanlan.zhihu.com/p/123456 or zhihu.com/p/123456
+  const match = url.match(/\/p\/(\d+)/);
+  return match ? match[1] : null;
+}
+
+function parseZhihuQuestionId(url) {
+  // zhihu.com/question/xxx (with or without /answer/yyy)
+  const match = url.match(/\/question\/(\d+)/);
+  return match ? match[1] : null;
+}
+
+function parseZhihuAnswerId(url) {
+  // zhihu.com/question/xxx/answer/yyy
+  const match = url.match(/\/question\/\d+\/answer\/(\d+)/);
+  return match ? match[1] : null;
+}
+
+function extractZhihuInitialData(html) {
+  // Zhihu SSR pages embed data in <script id="js-initialData">
+  const match = html.match(/<script\s+id="js-initialData"\s*[^>]*>([\s\S]*?)<\/script>/);
+  if (match) {
+    try {
+      return JSON.parse(match[1]);
+    } catch {}
+  }
+  return null;
+}
+
+function extractZhihuContent(initialData, articleId, questionId, answerId) {
+  try {
+    const entities = initialData.initialState?.entities;
+    if (!entities) return null;
+
+    // Case 1: Article (zhuanlan.zhihu.com/p/xxx)
+    if (articleId) {
+      const article = entities.articles?.[articleId];
+      if (article && article.content) {
+        return {
+          title: article.title || "",
+          content: article.content,
+          author: article.author?.name || "",
+          created: article.created ? new Date(article.created * 1000).toISOString() : "",
+          voteupCount: article.voteupCount || 0,
+        };
+      }
+    }
+
+    // Case 2: Specific answer (/question/xxx/answer/yyy)
+    if (answerId) {
+      const answer = entities.answers?.[answerId];
+      if (answer && answer.content) {
+        const questionTitle = entities.questions?.[questionId]?.title || answer.question?.title || "";
+        return {
+          title: questionTitle,
+          content: answer.content,
+          author: answer.author?.name || "",
+          created: answer.createdTime ? new Date(answer.createdTime * 1000).toISOString() : "",
+          voteupCount: answer.voteupCount || 0,
+        };
+      }
+    }
+
+    // Case 3: Question page (/question/xxx) — extract question + all answers
+    if (questionId) {
+      const question = entities.questions?.[questionId];
+      const answers = entities.answers || {};
+      const answerList = Object.values(answers).filter(a => a.content && a.content.length > 0);
+
+      if (question && answerList.length > 0) {
+        // Sort by votes descending
+        answerList.sort((a, b) => (b.voteupCount || 0) - (a.voteupCount || 0));
+
+        // Build combined HTML: question detail + all answers
+        const parts = [];
+        if (question.detail) parts.push(question.detail);
+        for (const a of answerList) {
+          parts.push(
+            `<h2>${a.author?.name || "Anonymous"} (${a.voteupCount || 0} votes)</h2>` +
+            a.content
+          );
+        }
+
+        return {
+          title: question.title || "",
+          content: parts.join("<hr>"),
+          author: "",
+          created: "",
+          voteupCount: 0,
+          answerCount: answerList.length,
+        };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+async function zhihuFetch(url) {
+  // Try: 1) manual config cookie  2) auto-extract from browser
+  const config = await loadConfig();
+  let cookie = config.zhihu?.cookie;
+
+  if (!cookie) {
+    info(`${c.dim}no manual cookie configured, trying browser extraction...${c.reset}`);
+    cookie = await extractBrowserCookies("zhihu.com");
+  }
+
+  if (!cookie) {
+    throw new Error(
+      "Zhihu requires cookies from your browser. On macOS, aread can auto-extract from Chrome — make sure you're logged in to zhihu.com.\n" +
+      "Or manually configure: aread config set zhihu.cookie \"<cookie from DevTools>\""
+    );
+  }
+
+  const timeout = parseInt(opts.timeout, 10) * 1000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cookie": cookie,
+        "Referer": "https://www.zhihu.com/",
+      },
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      if (res.status === 403) {
+        throw new Error("cookie expired or invalid. Please update: aread config set zhihu.cookie \"<new cookie>\"");
+      }
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const html = await res.text();
+
+    // Check if we got the JS challenge page instead of real content
+    if (html.includes('id="zh-zse-ck"') && html.length < 1000) {
+      throw new Error(
+        "cookie expired — Zhihu returned challenge page. Please update:\n" +
+        "  aread config set zhihu.cookie \"<new cookie from browser>\""
+      );
+    }
+
+    // Try to extract from initialData (best quality)
+    const articleId = parseZhihuArticleId(url);
+    const questionId = parseZhihuQuestionId(url);
+    const answerId = parseZhihuAnswerId(url);
+    const initialData = extractZhihuInitialData(html);
+
+    if (initialData) {
+      const extracted = extractZhihuContent(initialData, articleId, questionId, answerId);
+      if (extracted && extracted.content) {
+        const label = extracted.answerCount
+          ? `${extracted.answerCount} answers`
+          : "content";
+        info(`${c.green}✓${c.reset} ${c.dim}extracted ${label} from zhihu initialData${c.reset}`);
+
+        // Convert HTML content to markdown via turndown
+        let TurndownService;
+        try {
+          TurndownService = (await import("turndown")).default;
+        } catch {
+          throw new Error("turndown not installed. Run: npm i turndown");
+        }
+        const td = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+        const mdContent = td.turndown(extracted.content);
+
+        // Build final markdown with metadata
+        const meta = [];
+        if (extracted.title) meta.push(`# ${extracted.title}`);
+        if (extracted.author) meta.push(`> Author: ${extracted.author}`);
+        if (extracted.created) meta.push(`> Date: ${extracted.created.split("T")[0]}`);
+        if (extracted.voteupCount) meta.push(`> Votes: ${extracted.voteupCount}`);
+
+        return meta.length > 0
+          ? meta.join("\n") + "\n\n" + mdContent
+          : mdContent;
+      }
+    }
+
+    // No extractable content
+    throw new Error(
+      "could not extract content from this zhihu page. The page may have no answers yet or require JavaScript rendering."
+    );
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === "AbortError") throw new Error(`zhihu fetch timed out after ${opts.timeout}s`);
+    throw e;
+  }
+}
+
 async function fetchWithFallback(url) {
   // Check cache first
   const cached = await getCachedContent(url);
   if (cached) return { markdown: cached, cached: true };
+
+  // Zhihu: use dedicated fetch with user cookie
+  if (isZhihuUrl(url)) {
+    try {
+      const md = await zhihuFetch(url);
+      await setCachedContent(url, md);
+      return { markdown: md, cached: false };
+    } catch (e) {
+      throw new Error(`zhihu: ${e.message}`);
+    }
+  }
 
   // Warn early about known anti-crawl sites
   const antiCrawl = isAntiCrawlDomain(url);
@@ -1036,14 +1409,18 @@ if (opts["no-summarize"]) {
 // --- Main ---
 
 if (opts.search) {
+  // Merge positionals into search query (support: aread -s GLM 2026最新模型)
+  const searchQuery = positionals.length > 0 && !positionals[0].match(/^https?:\/\//)
+    ? [opts.search, ...positionals].join(" ")
+    : opts.search;
   const num = parseInt(opts.num, 10);
 
   let results;
 
   if (opts.multi) {
-    info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset} ${c.dim}(multi-engine)${c.reset}`);
+    info(`${c.dim}searching${c.reset} ${c.cyan}${searchQuery}${c.reset} ${c.dim}(multi-engine)${c.reset}`);
     try {
-      results = await multiEngineSearch(opts.search, num);
+      results = await multiEngineSearch(searchQuery, num);
     } catch (e) {
       die(e.message);
     }
@@ -1054,10 +1431,10 @@ if (opts.search) {
     }
 
     const engine = await resolveEngine(engineArg);
-    info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset} ${c.dim}(${engine})${c.reset}`);
+    info(`${c.dim}searching${c.reset} ${c.cyan}${searchQuery}${c.reset} ${c.dim}(${engine})${c.reset}`);
 
     try {
-      results = await searchWithFallback(engine, opts.search, num);
+      results = await searchWithFallback(engine, searchQuery, num);
     } catch (e) {
       die(e.message);
     }
@@ -1136,17 +1513,22 @@ if (opts.search) {
         process.stdout.write(jsonOutput + "\n");
       }
     } else {
+      const separator = "\n\n" + "=".repeat(60) + "\n\n";
       const parts = settled.map((s, i) => {
+        const num = `[${i + 1}/${settled.length}]`;
         if (s.status === "fulfilled") {
           const v = s.value;
-          const summaryBlock = v.summary ? `\n\n${v.summary}\n\n---\n` : "";
-          return `---\n\n## ${i + 1}. ${v.title}\n\n> Source: ${v.url}${summaryBlock}\n\n${v.markdown}`;
+          if (v.summary) {
+            // With AI summary: only output summary, skip full content to save tokens
+            return `## ${num} ${v.title}\n\n> Source: ${v.url}\n\n${v.summary}`;
+          }
+          return `## ${num} ${v.title}\n\n> Source: ${v.url}\n\n${v.markdown}`;
         }
         const errMsg = s.reason.message;
-        return `---\n\n## ${i + 1}. ${results[i].title}\n\n> Source: ${results[i].url}\n\n*Failed to fetch: ${errMsg}*`;
+        return `## ${num} ${results[i].title}\n\n> Source: ${results[i].url}\n\n*Failed to fetch: ${errMsg}*`;
       });
 
-      const output = parts.join("\n\n");
+      const output = parts.join(separator);
       if (opts.output) {
         await writeFile(opts.output, output, "utf-8");
         info(`\n${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(output)} bytes)${c.reset}`);
@@ -1204,10 +1586,8 @@ if (opts.search) {
         process.stdout.write(jsonOutput + "\n");
       }
     } else {
-      let output = body;
-      if (summary) {
-        output = `${summary}\n\n---\n\n${body}`;
-      }
+      // With AI summary: only output summary to save tokens
+      let output = summary || body;
       if (opts.output) {
         await writeFile(opts.output, output, "utf-8");
         info(
