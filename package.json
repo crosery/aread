@@ -29,6 +29,9 @@
     "type": "git",
     "url": "git+https://github.com/crosery/jread.git"
   },
+  "scripts": {
+    "test": "node --test test/cli.test.js"
+  },
   "dependencies": {
     "turndown": "^7.2.4"
   }
