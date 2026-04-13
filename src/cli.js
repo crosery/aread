@@ -55,6 +55,12 @@ const HTTP_ERROR_HINTS = {
   525: "site returned 525 (SSL handshake failed) — certificate or TLS issue between CDN and origin",
 };
 
+const ANTI_CRAWL_STATUS_CODES = new Set([403, 421, 429, 451, 521, 522, 523, 525]);
+
+function isAntiCrawlError(status) {
+  return ANTI_CRAWL_STATUS_CODES.has(status);
+}
+
 function describeHttpError(status, url) {
   const hint = HTTP_ERROR_HINTS[status];
   if (hint) return hint;
@@ -234,8 +240,7 @@ async function jinaFetch(url) {
 
   if (!res.ok) {
     const errMsg = describeHttpError(res.status, url);
-    const antiCrawl = isAntiCrawlDomain(url);
-    if (antiCrawl) {
+    if (isAntiCrawlDomain(url) && isAntiCrawlError(res.status)) {
       throw new Error(`${errMsg}. This is a known anti-crawl site — try accessing via a browser or use an alternative source`);
     }
     throw new Error(`${errMsg} for ${url}`);
@@ -301,7 +306,8 @@ async function fetchWithFallback(url) {
       return { markdown: md, cached: false };
     } catch (localErr) {
       const baseMsg = `jina: ${jinaErr.message}; local: ${localErr.message}`;
-      if (antiCrawl) {
+      // Only attach anti-crawl hint if the errors look like anti-crawl blocks (not 404, etc.)
+      if (antiCrawl && /\b(403|421|429|451|52[1-5]|empty|blocked|forbidden)\b/i.test(baseMsg)) {
         throw new Error(`${baseMsg}. This site has anti-crawl protection — try accessing via a browser or use an alternative source`);
       }
       throw new Error(baseMsg);
@@ -546,24 +552,73 @@ async function googleSearch(query, num) {
 
 // --- Baidu search ---
 
+function extractBaiduAbstract(block) {
+  // Strategy 1: Extract from <!--s-data:{"summaryData":...}--> JSON comments (modern Baidu SSR)
+  const sdataMatch = block.match(/<!--s-data:(\{"summaryData"[\s\S]*?)-->/);
+  if (sdataMatch) {
+    try {
+      const data = JSON.parse(sdataMatch[1]);
+      const lines = data.summaryData?.generalLines || [];
+      const texts = lines.flatMap((l) => (l.data || []).map((d) => d.text)).filter(Boolean);
+      if (texts.length > 0) {
+        return texts
+          .join(" ")
+          .replace(/<[^>]*>/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+    } catch {}
+  }
+
+  // Strategy 2: Rendered summary-text span (data-module="abstract" section)
+  const summaryMatch = block.match(/<span[^>]+class="[^"]*summary-text[^"]*"[^>]*>([\s\S]*?)<\/span>/i);
+  if (summaryMatch) {
+    const text = summaryMatch[1].replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+    if (text.length > 5) return text;
+  }
+
+  // Strategy 3: data-module="abstract" div content
+  const moduleMatch = block.match(/data-module="abstract"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/i);
+  if (moduleMatch) {
+    const text = moduleMatch[1].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").replace(/\s+/g, " ").trim();
+    if (text.length > 5) return text;
+  }
+
+  // Strategy 4: Classic c-abstract class
+  const classicMatch = block.match(/<(?:div|span)[^>]+class="[^"]*c-abstract[^"]*"[^>]*>([\s\S]*?)<\/(?:div|span)>/i);
+  if (classicMatch) {
+    const text = classicMatch[1].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").replace(/\s+/g, " ").trim();
+    if (text.length > 5) return text;
+  }
+
+  // Strategy 5: content-right class
+  const crMatch = block.match(/<(?:span|div|p)[^>]+class="[^"]*content-right[^"]*"[^>]*>([\s\S]*?)<\/(?:span|div|p)>/i);
+  if (crMatch) {
+    const text = crMatch[1].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").replace(/\s+/g, " ").trim();
+    if (text.length > 5) return text;
+  }
+
+  return "";
+}
+
 function parseBaiduHtml(html, num) {
   const results = [];
 
   // Split into result blocks: Baidu wraps each result in <div class="result c-container ...">
-  // or <div class="c-container ..."> with an id attribute
-  const resultBlockRegex = /<div[^>]+class="[^"]*(?:result\s+c-container|c-container)[^"]*"[^>]*>([\s\S]*?)(?=<div[^>]+class="[^"]*(?:result\s+c-container|c-container)[^"]*"|<div\s+id="(?:page|rs|content_right)")/gi;
+  const resultBlockRegex = /<div[^>]+class="[^"]*result\s+c-container[^"]*"[^>]*>([\s\S]*?)(?=<div[^>]+class="[^"]*result\s+c-container[^"]*"|<div\s+id="(?:page|rs|content_right|con-ar)")/gi;
   const resultBlocks = [...html.matchAll(resultBlockRegex)];
 
   for (const blockMatch of resultBlocks) {
     if (results.length >= num) break;
     const block = blockMatch[1];
 
-    // Extract title + URL from h3.t > a or a.c-title
-    const titleMatch = block.match(/<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i)
+    // Extract title + URL: try h3.t > a, then h3 > a with cosc-title, then a.c-title
+    const titleMatch = block.match(/<h3[^>]*class="[^"]*\bt\b[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i)
+      || block.match(/<h3[^>]*>\s*<a[^>]+class="[^"]*cosc-title[^"]*"[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i)
       || block.match(/<a[^>]+class="[^"]*c-title[^"]*"[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
     if (!titleMatch) continue;
 
-    const url = titleMatch[1];
+    const url = titleMatch[1].replace(/&amp;/g, "&");
     const title = titleMatch[2]
       .replace(/<[^>]*>/g, "")
       .replace(/<!--[\s\S]*?-->/g, "")
@@ -572,28 +627,13 @@ function parseBaiduHtml(html, num) {
 
     if (!url || !title || url.startsWith("javascript:")) continue;
 
-    // Extract abstract from various Baidu snippet containers
-    let abstract = "";
-    const abstractMatch =
-      block.match(/<span[^>]+class="[^"]*content-right[^"]*"[^>]*>([\s\S]*?)<\/span>/i)
-      || block.match(/<div[^>]+class="[^"]*c-abstract[^"]*"[^>]*>([\s\S]*?)<\/div>/i)
-      || block.match(/<span[^>]+class="[^"]*c-abstract[^"]*"[^>]*>([\s\S]*?)<\/span>/i)
-      || block.match(/<p[^>]+class="[^"]*content-right[^"]*"[^>]*>([\s\S]*?)<\/p>/i);
-    if (abstractMatch) {
-      abstract = (abstractMatch[1] || "")
-        .replace(/<[^>]*>/g, "")
-        .replace(/<!--[\s\S]*?-->/g, "")
-        .replace(/&[^;]+;/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-    }
-
+    const abstract = extractBaiduAbstract(block);
     results.push({ title, url, abstract });
   }
 
-  // Fallback: old parsing if block-based approach yielded nothing
+  // Fallback: old h3-based parsing if block-based approach yielded nothing
   if (results.length === 0) {
-    const h3Regex = /<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const h3Regex = /<h3[^>]*class="[^"]*\bt\b[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
     const h3Blocks = [...html.matchAll(h3Regex)];
     for (const block of h3Blocks) {
       if (results.length >= num) break;
