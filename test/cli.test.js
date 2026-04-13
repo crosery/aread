@@ -2,11 +2,13 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { writeFile, readFile, mkdir, rm, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
-const CLI = join(import.meta.dirname, "..", "src", "cli.js");
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CLI = join(__dirname, "..", "src", "cli.js");
 
 function run(args, { env = {}, timeout = 30000 } = {}) {
   return new Promise((resolve, reject) => {
