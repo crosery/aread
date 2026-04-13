@@ -985,16 +985,14 @@ async function zhihuFetch(url) {
       }
     }
 
-    // Fallback: convert full HTML via turndown
-    info(`${c.dim}initialData not found, converting full HTML...${c.reset}`);
-    let TurndownService;
-    try {
-      TurndownService = (await import("turndown")).default;
-    } catch {
-      throw new Error("turndown not installed. Run: npm i turndown");
-    }
-    const td = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
-    return td.turndown(html);
+    // No extractable content — zhihu answer/question pages are CSR (content loaded by JS)
+    const pageType = answerId ? "answer" : articleId ? "article" : "page";
+    throw new Error(
+      `could not extract content from this zhihu ${pageType}. ` +
+      (answerId
+        ? "Zhihu answer pages are client-side rendered and cannot be fetched without a headless browser."
+        : "The page may require JavaScript rendering to display content.")
+    );
   } catch (e) {
     clearTimeout(timer);
     if (e.name === "AbortError") throw new Error(`zhihu fetch timed out after ${opts.timeout}s`);
