@@ -550,7 +550,7 @@ ${c.bold}READ OPTIONS${c.reset}
     --no-summarize             Disable AI summary (override autoSummarize)
 
 ${c.bold}SEARCH OPTIONS${c.reset}
-    -s, --search <QUERY>       Search the web
+    -s, --search <QUERY>       Search the web (use quotes for multi-word: -s "query here")
     -n, --num <N>              Number of search results (default: 10)
     -e, --engine <ENGINE>      Search engine: duckduckgo|bing|auto
                                (default: duckduckgo, auto probes DDG then falls back to Bing)
@@ -1408,14 +1408,18 @@ if (opts["no-summarize"]) {
 // --- Main ---
 
 if (opts.search) {
+  // Merge positionals into search query (support: aread -s GLM 2026最新模型)
+  const searchQuery = positionals.length > 0 && !positionals[0].match(/^https?:\/\//)
+    ? [opts.search, ...positionals].join(" ")
+    : opts.search;
   const num = parseInt(opts.num, 10);
 
   let results;
 
   if (opts.multi) {
-    info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset} ${c.dim}(multi-engine)${c.reset}`);
+    info(`${c.dim}searching${c.reset} ${c.cyan}${searchQuery}${c.reset} ${c.dim}(multi-engine)${c.reset}`);
     try {
-      results = await multiEngineSearch(opts.search, num);
+      results = await multiEngineSearch(searchQuery, num);
     } catch (e) {
       die(e.message);
     }
@@ -1426,10 +1430,10 @@ if (opts.search) {
     }
 
     const engine = await resolveEngine(engineArg);
-    info(`${c.dim}searching${c.reset} ${c.cyan}${opts.search}${c.reset} ${c.dim}(${engine})${c.reset}`);
+    info(`${c.dim}searching${c.reset} ${c.cyan}${searchQuery}${c.reset} ${c.dim}(${engine})${c.reset}`);
 
     try {
-      results = await searchWithFallback(engine, opts.search, num);
+      results = await searchWithFallback(engine, searchQuery, num);
     } catch (e) {
       die(e.message);
     }
@@ -1513,8 +1517,11 @@ if (opts.search) {
         const num = `[${i + 1}/${settled.length}]`;
         if (s.status === "fulfilled") {
           const v = s.value;
-          const summaryBlock = v.summary ? `\n\n${v.summary}\n\n---\n` : "";
-          return `## ${num} ${v.title}\n\n> Source: ${v.url}${summaryBlock}\n\n${v.markdown}`;
+          if (v.summary) {
+            // With AI summary: only output summary, skip full content to save tokens
+            return `## ${num} ${v.title}\n\n> Source: ${v.url}\n\n${v.summary}`;
+          }
+          return `## ${num} ${v.title}\n\n> Source: ${v.url}\n\n${v.markdown}`;
         }
         const errMsg = s.reason.message;
         return `## ${num} ${results[i].title}\n\n> Source: ${results[i].url}\n\n*Failed to fetch: ${errMsg}*`;
@@ -1578,10 +1585,8 @@ if (opts.search) {
         process.stdout.write(jsonOutput + "\n");
       }
     } else {
-      let output = body;
-      if (summary) {
-        output = `${summary}\n\n---\n\n${body}`;
-      }
+      // With AI summary: only output summary to save tokens
+      let output = summary || body;
       if (opts.output) {
         await writeFile(opts.output, output, "utf-8");
         info(
