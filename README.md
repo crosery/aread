@@ -1,17 +1,19 @@
 # aread
 
-**AI-first web reader & search.** The `a` stands for AI — built for agents that need structured web content in one call.
+**AI-first web reader & search with AI summarization.** The `a` stands for AI — built for agents that need structured web content in one call.
 
 ```bash
 aread https://example.com              # read any page as Markdown
+aread example.com --summarize          # read + AI summary
 aread -s "rust async tutorial"         # search the web
 aread -s "react hooks" --read          # search + read all results
 aread -s "LLM evaluation" --multi      # query all engines, merge & deduplicate
+aread config init                      # setup AI summarization
 ```
 
 - Zero runtime dependencies (optional `turndown` for local fallback)
-- No API keys needed
-- No Python needed
+- AI summarization via OpenAI-compatible APIs (OpenAI, Groq, OpenRouter, xAI, SiliconFlow, LongCat)
+- Zhihu article support with auto browser cookie extraction (macOS)
 - Works on Linux, macOS, Windows
 - Single file, structured output designed for LLM consumption
 
@@ -20,10 +22,11 @@ aread -s "LLM evaluation" --multi      # query all engines, merge & deduplicate
 AI agents need web content as clean, structured text — not HTML soup. `aread` gives agents:
 
 - **One-call web reading** — any URL to Markdown, handling JS rendering and anti-scraping
-- **Multi-source search** — query 4 engines in parallel, get deduplicated results
+- **AI summarization** — distill pages to key facts via any OpenAI-compatible API
+- **Multi-source search** — query multiple engines in parallel, get deduplicated results
+- **Zhihu support** — auto-extract browser cookies to read zhihu.com articles and answers
 - **Structured output** — `--json` for machine parsing, `--raw` for pipe-friendly text
 - **Graceful degradation** — engine failures are silently skipped, partial results still returned
-- **No interactive prompts** — every option is a flag, designed for programmatic use
 
 ## Install
 
@@ -51,7 +54,7 @@ aread --json example.com            # structured JSON output
 
 If Jina is unreachable, aread falls back to local fetch + [turndown](https://github.com/mixmark-io/turndown) (install with `npm i turndown` for fallback support).
 
-Results are cached locally (`~/.cache/aread/`). Use `--no-cache` to bypass.
+Results are cached locally (`~/.cache/aread/`) with 24h expiry. Use `--no-cache` to bypass.
 
 ### Jina Headers
 
@@ -71,6 +74,88 @@ aread -H "X-No-Cache:true" https://example.com                   # bypass Jina c
 | `X-No-Cache` | bypass Jina cache |
 | `X-Target-Selector` | extract specific CSS selector |
 
+## AI Summarization
+
+Summarize any fetched content using an OpenAI-compatible AI API. Preserves 90% of information — only strips filler, repetition, and noise.
+
+### Setup
+
+Interactive setup (recommended):
+
+```bash
+aread config init
+```
+
+Or manual configuration:
+
+```bash
+aread config set ai.provider openrouter      # choose provider
+aread config set ai.apiKey sk-xxx            # set API key
+aread config set ai.model google/gemini-2.0-flash-001  # set model
+aread config set ai.autoSummarize true       # auto-summarize every fetch
+```
+
+### Built-in Providers
+
+| Provider | Base URL |
+|----------|----------|
+| openai | `https://api.openai.com/v1` |
+| groq | `https://api.groq.com/openai/v1` |
+| openrouter | `https://openrouter.ai/api/v1` |
+| xai | `https://api.x.ai/v1` |
+| siliconflow | `https://api.siliconflow.cn/v1` |
+| longcat | `https://api.longcat.chat/openai/v1` |
+
+Or use any OpenAI-compatible endpoint:
+
+```bash
+aread config set ai.baseUrl https://your-api.com/v1
+```
+
+### Usage
+
+```bash
+aread example.com -S               # one-time summarize with -S flag
+aread example.com --summarize      # same as -S
+aread example.com --no-summarize   # disable auto-summarize for this call
+```
+
+With `ai.autoSummarize` set to `true`, every fetch automatically includes an AI summary.
+
+### Config Management
+
+```bash
+aread config show                  # view current config (secrets masked)
+aread config providers             # list all built-in providers
+aread config get ai.model          # get a specific value
+aread config delete ai.apiKey      # delete a value
+```
+
+## Zhihu Support
+
+aread can fetch articles and answers from zhihu.com (知乎) — a site with aggressive anti-crawling protection.
+
+On **macOS**, aread automatically extracts cookies from your Chrome/Arc/Edge/Brave browser. Just make sure you're logged in to zhihu.com in your browser.
+
+```bash
+aread https://zhuanlan.zhihu.com/p/696916846     # article — auto works
+aread https://www.zhihu.com/question/123456       # question + all answers
+```
+
+Supported page types:
+
+| Type | URL Pattern | What's extracted |
+|------|-------------|------------------|
+| Article | `zhuanlan.zhihu.com/p/xxx` | Title, author, date, full content |
+| Question | `zhihu.com/question/xxx` | Question + all answers (sorted by votes) |
+| Answer | `zhihu.com/question/xxx/answer/yyy` | Specific answer with question title |
+
+Manual cookie configuration (if auto-extraction doesn't work):
+
+```bash
+aread config set zhihu.cookie "<cookie from browser DevTools>"
+```
+
 ## Search
 
 Search the web with multiple engine support. No API keys, no tracking.
@@ -82,34 +167,27 @@ aread -s "react hooks" -e bing               # use specific engine
 aread -s "kubernetes" --json                  # JSON output for agents
 ```
 
+**Note:** Use quotes for multi-word queries: `aread -s "query with spaces"`.
+
 ### Engines
 
 | Engine | Flag | Notes |
 |--------|------|-------|
 | DuckDuckGo | `-e duckduckgo` | Private, no tracking |
 | Bing | `-e bing` | Reliable, good international coverage |
-| Google | `-e google` | Broad results |
-| Baidu | `-e baidu` | Best for Chinese content |
 | Auto | `-e auto` (default) | Probes DuckDuckGo, falls back to Bing |
 
 If the chosen engine fails, aread automatically tries fallback engines before giving up.
 
 ### Multi-Engine Search (`--multi`)
 
-Query all engines concurrently and get merged, deduplicated results — ideal for agents that want maximum coverage in one call.
+Query all engines concurrently and get merged, deduplicated results.
 
 ```bash
-aread -s "WebAssembly" --multi               # query all 4 engines at once
+aread -s "WebAssembly" --multi               # query all engines at once
 aread -s "transformer architecture" -m       # -m shorthand
 aread -s "bilibili" --multi --json           # JSON output
-aread -s "react server components" -m -n 5   # 5 results per engine, merged
 ```
-
-How it works:
-- Sends queries to bing, google, baidu, and duckduckgo in parallel via `Promise.allSettled`
-- Merges all results, deduplicating by normalized URL (first occurrence wins)
-- Any engine that fails is silently skipped — you still get results from the rest
-- Output format is identical to single-engine search
 
 ### Search + Read
 
@@ -122,7 +200,7 @@ aread -s "SQLite vs PostgreSQL" --read -n 3             # top 3, read all
 aread -s "LLM agents" --multi --read                    # multi-engine + read
 ```
 
-Concurrent page reading is controlled with `-c` (default: 5 concurrent reads).
+With AI summarization enabled, search + read outputs only the AI summary for each result — saving tokens while preserving key information.
 
 ## Agent Integration
 
@@ -137,35 +215,29 @@ aread -r -s "WebAssembly 2024" --multi --read | claude "explain the key trends"
 
 # Structured JSON for programmatic use
 aread -s "react hooks" --multi --json | jq '.[].url'
-
-# Compare technologies
-aread -r -s "Bun vs Node.js benchmark" --read | claude "make a comparison table"
 ```
 
 ### JSON Output
 
-Use `--json` for machine-readable output — perfect for agent tool integration:
+Use `--json` for machine-readable output:
 
 ```bash
 # Search results as JSON array
 aread -s "example" --json
-# [{ "title": "...", "url": "...", "abstract": "..." }, ...]
 
-# Read a page as JSON
+# Read a page as JSON (includes summary field when AI is configured)
 aread --json https://example.com
-# { "url": "...", "title": null, "markdown": "...", "cached": false, "error": null }
-
-# Search + read as JSON (includes markdown content)
-aread -s "example" --read --json
-# [{ "url": "...", "title": "...", "markdown": "...", "cached": false, "error": null }, ...]
+# { "url": "...", "markdown": "...", "summary": "...", "cached": false, "error": null }
 ```
 
 ## All Options
 
 ```
-aread <URL>                Read a page as Markdown
-aread -s <QUERY>           Search the web
-aread -s <QUERY> --read    Search + read top results
+aread <URL>                  Read a page as Markdown
+aread <URL> --summarize      Read + AI summary
+aread -s <QUERY>             Search the web
+aread -s <QUERY> --read      Search + read top results
+aread config                 Manage configuration
 ```
 
 | Flag | Description |
@@ -174,27 +246,28 @@ aread -s <QUERY> --read    Search + read top results
 | `-r, --raw` | No status messages, pipe-friendly |
 | `-t, --timeout <SEC>` | Timeout in seconds (default: 30) |
 | `-H, --header <K:V>` | Extra Jina header (repeatable) |
-| `-s, --search <QUERY>` | Search the web |
+| `-s, --search <QUERY>` | Search the web (use quotes for multi-word) |
 | `-n, --num <N>` | Number of results (default: 10) |
-| `-e, --engine <ENGINE>` | Search engine: `duckduckgo\|bing\|google\|baidu\|auto` (default: auto) |
-| `-m, --multi` | Query all engines concurrently, merge & deduplicate |
+| `-e, --engine <ENGINE>` | Search engine: `duckduckgo\|bing\|auto` (default: auto) |
+| `-m, --multi` | Query all engines concurrently |
 | `--read` | Fetch each search result as Markdown |
 | `-c, --concurrency <N>` | Concurrent reads with `--read` (default: 5) |
+| `-S, --summarize` | AI summarize (requires config) |
+| `--no-summarize` | Disable auto-summarize |
 | `--no-cache` | Skip URL cache |
 | `--json` | Structured JSON output |
-| `-h, --help` | Show help |
-| `-v, --version` | Show version |
 
 ## How It Works
 
 | Feature | Implementation | Cost |
 |---------|---------------|------|
 | **Read** | [Jina Reader](https://jina.ai/reader/) with local turndown fallback | Free |
-| **Search** | Native HTTP scraping of DuckDuckGo, Bing, Google, Baidu | Free |
-| **Multi** | `Promise.allSettled` concurrent queries + URL deduplication | Free |
-| **Cache** | SHA-256 URL hashing to `~/.cache/aread/` | Local |
+| **Search** | Native HTTP scraping of DuckDuckGo, Bing | Free |
+| **Summarize** | OpenAI-compatible API (user-provided key) | Per-token |
+| **Zhihu** | Browser cookie extraction + SSR data parsing | Free |
+| **Cache** | SHA-256 URL hashing to `~/.cache/aread/`, 24h expiry | Local |
 
-No Python. No external binaries. No API keys. Just Node.js 18+.
+No Python. No external binaries. No API keys required (except optional AI summarization). Just Node.js 18+.
 
 ## License
 

@@ -21,7 +21,7 @@ if (platform() === "win32") {
   }
 }
 
-const VERSION = "1.6.0";
+const VERSION = "1.7.0";
 const JINA_READ = "https://r.jina.ai";
 const SUPPORTED_ENGINES = ["duckduckgo", "bing", "auto"];
 const DDG_PROBE_TIMEOUT = 3000;
