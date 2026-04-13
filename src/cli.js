@@ -1502,17 +1502,19 @@ if (opts.search) {
         process.stdout.write(jsonOutput + "\n");
       }
     } else {
+      const separator = "\n\n" + "=".repeat(60) + "\n\n";
       const parts = settled.map((s, i) => {
+        const num = `[${i + 1}/${settled.length}]`;
         if (s.status === "fulfilled") {
           const v = s.value;
           const summaryBlock = v.summary ? `\n\n${v.summary}\n\n---\n` : "";
-          return `---\n\n## ${i + 1}. ${v.title}\n\n> Source: ${v.url}${summaryBlock}\n\n${v.markdown}`;
+          return `## ${num} ${v.title}\n\n> Source: ${v.url}${summaryBlock}\n\n${v.markdown}`;
         }
         const errMsg = s.reason.message;
-        return `---\n\n## ${i + 1}. ${results[i].title}\n\n> Source: ${results[i].url}\n\n*Failed to fetch: ${errMsg}*`;
+        return `## ${num} ${results[i].title}\n\n> Source: ${results[i].url}\n\n*Failed to fetch: ${errMsg}*`;
       });
 
-      const output = parts.join("\n\n");
+      const output = parts.join(separator);
       if (opts.output) {
         await writeFile(opts.output, output, "utf-8");
         info(`\n${c.green}saved${c.reset} ${c.bold}${opts.output}${c.reset} ${c.dim}(${Buffer.byteLength(output)} bytes)${c.reset}`);
