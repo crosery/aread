@@ -19,10 +19,48 @@ if (platform() === "win32") {
   }
 }
 
-const VERSION = "1.3.1";
+const VERSION = "1.4.1";
 const JINA_READ = "https://r.jina.ai";
 const SUPPORTED_ENGINES = ["duckduckgo", "bing", "google", "baidu", "auto"];
 const DDG_PROBE_TIMEOUT = 3000;
+
+// --- Known anti-crawl domains and HTTP error explanations ---
+
+const ANTI_CRAWL_DOMAINS = new Set([
+  "csdn.net", "blog.csdn.net", "wenku.csdn.net",
+  "zhihu.com", "zhuanlan.zhihu.com",
+  "jianshu.com",
+  "segmentfault.com",
+  "juejin.cn",
+]);
+
+function isAntiCrawlDomain(url) {
+  try {
+    const host = new URL(url).hostname;
+    for (const domain of ANTI_CRAWL_DOMAINS) {
+      if (host === domain || host.endsWith("." + domain)) return true;
+    }
+  } catch {}
+  return false;
+}
+
+const HTTP_ERROR_HINTS = {
+  403: "site returned 403 Forbidden — access denied, likely requires authentication or blocks automated requests",
+  421: "site returned 421 — too many connections from this IP, try again later",
+  429: "site returned 429 Too Many Requests — rate limited, try again later",
+  451: "site returned 451 — content unavailable for legal reasons",
+  521: "site returned 521 (Cloudflare anti-bot) — the site uses Web Application Firewall protection and cannot be accessed programmatically. Try accessing via a browser instead",
+  522: "site returned 522 (Cloudflare connection timed out) — the origin server is unreachable",
+  523: "site returned 523 (Cloudflare origin unreachable) — DNS or origin server issue",
+  525: "site returned 525 (SSL handshake failed) — certificate or TLS issue between CDN and origin",
+};
+
+function describeHttpError(status, url) {
+  const hint = HTTP_ERROR_HINTS[status];
+  if (hint) return hint;
+  if (status >= 500) return `site returned ${status} (server error) — the server encountered an internal error`;
+  return `HTTP ${status}`;
+}
 
 // --- Colors (auto-detect TTY) ---
 
@@ -194,10 +232,17 @@ async function jinaFetch(url) {
   });
   clearTimeout(timer);
 
-  if (!res.ok) die(`HTTP ${res.status} ${res.statusText} for ${url}`);
+  if (!res.ok) {
+    const errMsg = describeHttpError(res.status, url);
+    const antiCrawl = isAntiCrawlDomain(url);
+    if (antiCrawl) {
+      throw new Error(`${errMsg}. This is a known anti-crawl site — try accessing via a browser or use an alternative source`);
+    }
+    throw new Error(`${errMsg} for ${url}`);
+  }
 
   const body = await res.text();
-  if (!body.trim()) die(`empty response for ${url} - try: aread -H "X-No-Cache:true" ${url}`);
+  if (!body.trim()) throw new Error(`empty response for ${url} - try: aread -H "X-No-Cache:true" ${url}`);
 
   return body;
 }
@@ -216,7 +261,10 @@ async function localFetch(url) {
   });
   clearTimeout(timer);
 
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const errMsg = describeHttpError(res.status, url);
+    throw new Error(errMsg);
+  }
   const html = await res.text();
 
   let TurndownService;
@@ -235,6 +283,12 @@ async function fetchWithFallback(url) {
   const cached = await getCachedContent(url);
   if (cached) return { markdown: cached, cached: true };
 
+  // Warn early about known anti-crawl sites
+  const antiCrawl = isAntiCrawlDomain(url);
+  if (antiCrawl) {
+    info(`${c.red}Warning${c.reset}: ${new URL(url).hostname} is a known anti-crawl site — fetch may fail or return incomplete content`);
+  }
+
   try {
     const md = await jinaFetch(url);
     await setCachedContent(url, md);
@@ -246,7 +300,11 @@ async function fetchWithFallback(url) {
       await setCachedContent(url, md);
       return { markdown: md, cached: false };
     } catch (localErr) {
-      throw new Error(`jina: ${jinaErr.message}; local: ${localErr.message}`);
+      const baseMsg = `jina: ${jinaErr.message}; local: ${localErr.message}`;
+      if (antiCrawl) {
+        throw new Error(`${baseMsg}. This site has anti-crawl protection — try accessing via a browser or use an alternative source`);
+      }
+      throw new Error(baseMsg);
     }
   }
 }
@@ -490,23 +548,60 @@ async function googleSearch(query, num) {
 
 function parseBaiduHtml(html, num) {
   const results = [];
-  // Baidu wraps results in h3 with class containing "t", linking to baidu redirect URLs
-  const blockRegex = /<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-  const blocks = [...html.matchAll(blockRegex)];
 
-  for (const block of blocks) {
+  // Split into result blocks: Baidu wraps each result in <div class="result c-container ...">
+  // or <div class="c-container ..."> with an id attribute
+  const resultBlockRegex = /<div[^>]+class="[^"]*(?:result\s+c-container|c-container)[^"]*"[^>]*>([\s\S]*?)(?=<div[^>]+class="[^"]*(?:result\s+c-container|c-container)[^"]*"|<div\s+id="(?:page|rs|content_right)")/gi;
+  const resultBlocks = [...html.matchAll(resultBlockRegex)];
+
+  for (const blockMatch of resultBlocks) {
     if (results.length >= num) break;
-    const url = block[1];
-    const title = block[2]
+    const block = blockMatch[1];
+
+    // Extract title + URL from h3.t > a or a.c-title
+    const titleMatch = block.match(/<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i)
+      || block.match(/<a[^>]+class="[^"]*c-title[^"]*"[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
+    if (!titleMatch) continue;
+
+    const url = titleMatch[1];
+    const title = titleMatch[2]
       .replace(/<[^>]*>/g, "")
       .replace(/<!--[\s\S]*?-->/g, "")
       .replace(/&[^;]+;/g, "")
       .trim();
 
-    // Skip javascript: URLs and empty URLs
     if (!url || !title || url.startsWith("javascript:")) continue;
 
-    results.push({ title, url, abstract: "" });
+    // Extract abstract from various Baidu snippet containers
+    let abstract = "";
+    const abstractMatch =
+      block.match(/<span[^>]+class="[^"]*content-right[^"]*"[^>]*>([\s\S]*?)<\/span>/i)
+      || block.match(/<div[^>]+class="[^"]*c-abstract[^"]*"[^>]*>([\s\S]*?)<\/div>/i)
+      || block.match(/<span[^>]+class="[^"]*c-abstract[^"]*"[^>]*>([\s\S]*?)<\/span>/i)
+      || block.match(/<p[^>]+class="[^"]*content-right[^"]*"[^>]*>([\s\S]*?)<\/p>/i);
+    if (abstractMatch) {
+      abstract = (abstractMatch[1] || "")
+        .replace(/<[^>]*>/g, "")
+        .replace(/<!--[\s\S]*?-->/g, "")
+        .replace(/&[^;]+;/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    results.push({ title, url, abstract });
+  }
+
+  // Fallback: old parsing if block-based approach yielded nothing
+  if (results.length === 0) {
+    const h3Regex = /<h3[^>]*class="[^"]*t[^"]*"[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const h3Blocks = [...html.matchAll(h3Regex)];
+    for (const block of h3Blocks) {
+      if (results.length >= num) break;
+      const url = block[1];
+      const title = block[2].replace(/<[^>]*>/g, "").replace(/<!--[\s\S]*?-->/g, "").replace(/&[^;]+;/g, "").trim();
+      if (!url || !title || url.startsWith("javascript:")) continue;
+      results.push({ title, url, abstract: "" });
+    }
   }
 
   // Fallback: try c-title links (newer Baidu layout)
@@ -727,13 +822,13 @@ function formatSearchResults(results) {
       (r, i) =>
         `${c.bold}${i + 1}.${c.reset} ${c.cyan}${r.title}${c.reset}\n` +
         `   ${c.dim}${r.url}${c.reset}\n` +
-        `   ${r.abstract || ""}`
+        `   ${r.abstract || `${c.dim}(no abstract available)${c.reset}`}`
     )
     .join("\n\n");
 }
 
 function formatSearchResultsRaw(results) {
-  return results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.abstract || ""}`).join("\n\n");
+  return results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.abstract || "(no abstract available)"}`).join("\n\n");
 }
 
 // --- Main ---
@@ -782,6 +877,26 @@ if (opts.search) {
       return { index: i, title: r.title, url: r.url, markdown, cached: wasCached };
     });
 
+    // Compute batch read statistics
+    const successes = settled.filter((s) => s.status === "fulfilled");
+    const failures = settled.filter((s) => s.status === "rejected");
+    const failDetails = failures.map((s, fi) => {
+      // Find the original index of this failure
+      const origIdx = settled.indexOf(s);
+      return { idx: origIdx + 1, url: results[origIdx].url, reason: s.reason.message };
+    });
+
+    // Print summary statistics
+    info(`\n${c.bold}Read summary:${c.reset} ${c.green}${successes.length} succeeded${c.reset}, ${failures.length > 0 ? c.red : c.dim}${failures.length} failed${c.reset} out of ${settled.length} pages`);
+    if (failDetails.length > 0) {
+      for (const f of failDetails) {
+        info(`  ${c.red}✗${c.reset} [${f.idx}] ${f.url} — ${f.reason}`);
+      }
+      if (successes.length === 0) {
+        info(`\n${c.red}All pages failed to fetch.${c.reset} The search results may point to sites with anti-crawl protection. Try different search terms or a different engine.`);
+      }
+    }
+
     if (opts.json) {
       const jsonResults = settled.map((s, i) => {
         if (s.status === "fulfilled") {
@@ -802,7 +917,8 @@ if (opts.search) {
           const v = s.value;
           return `---\n\n## ${i + 1}. ${v.title}\n\n> Source: ${v.url}\n\n${v.markdown}`;
         }
-        return `---\n\n## ${i + 1}. ${results[i].title}\n\n> Source: ${results[i].url}\n\n*Failed to fetch*`;
+        const errMsg = s.reason.message;
+        return `---\n\n## ${i + 1}. ${results[i].title}\n\n> Source: ${results[i].url}\n\n*Failed to fetch: ${errMsg}*`;
       });
 
       const output = parts.join("\n\n");
