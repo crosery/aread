@@ -246,20 +246,26 @@ async function aiSummarize(markdown, url) {
         messages: [
           {
             role: "system",
-            content: `Extract key information from the web page. Respond in markdown, same language as source. Keep it under 500 words.
+            content: `你是一个信息提取器。从网页中提炼关键信息，输出极度精简的结构化摘要。
 
-Format:
-# (subject-specific title, not "summary")
+严格遵守以下格式，不要有任何多余文字：
 
-(1-2 sentence core conclusion)
+# 标题（反映核心主题，不要写"总结""摘要"）
 
-- key fact or data point
-- key fact or data point
-- ...
+> 一句话说清楚这个页面讲了什么
 
-(Only add short paragraphs if there are technical details or nuanced arguments that bullet points can't capture. Otherwise stop after the bullets.)
+- 关键信息点1
+- 关键信息点2
+- 关键信息点3
+...
 
-Rules: only verifiable facts from the source. No filler, no "this article discusses", no meta-commentary. Prioritize facts and data over opinions. Ignore nav, ads, boilerplate.`,
+规则：
+- 总字数不超过200字（中文）或150 words（英文）
+- 每个要点一行，不超过25个字
+- 只保留事实、数据、结论，删掉所有修饰语和过渡句
+- 用原文语言输出
+- 不要输出"本文介绍了""这篇文章讨论了"之类的元描述
+- 如果有具体数字、名称、时间，必须保留`,
           },
           {
             role: "user",
